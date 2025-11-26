@@ -1,11 +1,17 @@
 #!/bin/bash
 # ==============================================================================
-# Apache Smart Tuner v1.17.0 for cPanel / WHM & generic Apache
+# Apache Smart Tuner v1.18.0 for cPanel / WHM & generic Apache
 # Author: Ryan MacDonald <ryan@rfxn.com>
 # License: GPL-3.0-or-later
 #
-# - Tiered by RAM & cores: LOW, LOW-MID, MID, HIGH
+# - Tiered by RAM & cores: LOW, LOW-MID, MID, MID-HIGH, HIGH
 # - PHP-aware: conservative CPU caps on MID/HIGH
+# - Tiered MaxRequestWorkers caps (prefork and threaded):
+#     * LOW:       128
+#     * LOW-MID:   256
+#     * MID:       1024
+#     * MID-HIGH:  2048
+#     * HIGH:      4096
 # - Floors:
 #     * Prefork:   ServerLimit / MaxRequestWorkers >= 128
 #     * Event/worker: MaxRequestWorkers >= 128 (threads)
@@ -25,7 +31,7 @@
 set -u   # keep "undefined var" safety; avoid -e/pipefail to prevent silent exits
 
 VERSION_MAJOR=1
-VERSION_MINOR=17
+VERSION_MINOR=18
 VERSION_PATCH=0
 VERSION="${VERSION_MAJOR}.${VERSION_MINOR}.${VERSION_PATCH}"
 VERSION_NAME="Apache Smart Tuner v${VERSION}"
@@ -363,7 +369,7 @@ infer_mpm_from_config() {
     echo ""
 }
 
-set_tier_params() {
+set_tier_params() { 
     if [[ "$TOTAL_MEM" -le 2048 || "$CORES" -le 2 ]]; then
         TIER="LOW"
         APACHE_PCT="0.30"
@@ -373,8 +379,8 @@ set_tier_params() {
         MIN_SPARE=1
         MAX_SPARE=2
         MAX_CONN_PER_CHILD=2000
-        MRW_CAP_PREFORK=256
-        MRW_CAP_THREADED=512
+        MRW_CAP_PREFORK=128
+        MRW_CAP_THREADED=128
     elif [[ "$TOTAL_MEM" -le 8192 && "$CORES" -ge 2 ]]; then
         TIER="LOW-MID"
         APACHE_PCT="0.35"
@@ -384,8 +390,8 @@ set_tier_params() {
         MIN_SPARE=2
         MAX_SPARE=5
         MAX_CONN_PER_CHILD=4000
-        MRW_CAP_PREFORK=512
-        MRW_CAP_THREADED=2000
+        MRW_CAP_PREFORK=256
+        MRW_CAP_THREADED=256
     elif [[ "$TOTAL_MEM" -le 16384 && "$CORES" -ge 4 ]]; then
         TIER="MID"
         APACHE_PCT="0.40"
@@ -395,8 +401,19 @@ set_tier_params() {
         MIN_SPARE=3
         MAX_SPARE=8
         MAX_CONN_PER_CHILD=8000
-        MRW_CAP_PREFORK=800
-        MRW_CAP_THREADED=6000
+        MRW_CAP_PREFORK=1024
+        MRW_CAP_THREADED=1024
+    elif [[ "$TOTAL_MEM" -le 32768 && "$CORES" -ge 8 ]]; then
+        TIER="MID-HIGH"
+        APACHE_PCT="0.43"
+        PROCS_PER_CORE_CAP=44
+        THREADS_PER_CORE_CAP=200
+        START_SERVERS=4
+        MIN_SPARE=4
+        MAX_SPARE=10
+        MAX_CONN_PER_CHILD=9000
+        MRW_CAP_PREFORK=2048
+        MRW_CAP_THREADED=2048
     else
         TIER="HIGH"
         APACHE_PCT="0.45"
@@ -406,8 +423,8 @@ set_tier_params() {
         MIN_SPARE=5
         MAX_SPARE=12
         MAX_CONN_PER_CHILD=10000
-        MRW_CAP_PREFORK=1600
-        MRW_CAP_THREADED=12000
+        MRW_CAP_PREFORK=4096
+        MRW_CAP_THREADED=4096
     fi
 
     if [[ -n "$BUDGET_OVERRIDE" ]]; then

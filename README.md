@@ -4,8 +4,8 @@ Apache Smart Tuner is a Bash-based capacity planner for Apache HTTP Server that 
 
 ## What it does
 - **Resource- and PHP-aware tuning:** Uses total RAM, CPU cores, observed httpd RSS, and PHP-friendly CPU caps to calculate safe concurrency limits per MPM.
-- **Tiered profiles:** LOW, LOW-MID, MID, and HIGH profiles automatically cap ServerLimit/MaxRequestWorkers (or threads) for a wide range of footprints.
-- **Cautious floors and caps:** Enforces sensible minimums (128 workers/threads) while honoring tier ceilings to avoid runaway prefork deployments.
+- **Tiered profiles:** LOW, LOW-MID, MID, MID-HIGH, and HIGH profiles automatically cap ServerLimit/MaxRequestWorkers (or threads) for a wide range of footprints.
+- **Cautious floors and caps:** Enforces sensible minimums (128 workers/threads) while honoring tier ceilings (128/256/1024/2048/4096 by tier) to avoid runaway prefork deployments.
 - **Clear visibility:** Prints current versus proposed settings, emits an annotated config block, and now supports machine-readable JSON output for automation.
 - **Safe application path:** Creates timestamped backups, scrubs legacy MPM blocks, validates with `configtest`, and reloads (or optionally skips reload) only after a clean validation.
 - **cPanel/WHM integration:** Prefers `pre_virtualhost_global.conf` when present, falls back to `pre_main_global.conf`, and triggers `/scripts/rebuildhttpdconf` when applying changes.
@@ -67,33 +67,33 @@ Text analysis output includes environment detection, current vs proposed values,
 ------------------------------------------------
 Detected MPM:           prefork
 Tier:                   LOW-MID
-Total RAM:              4096 MB
+Total RAM:              8192 MB
 CPU Cores:              4
 Apache running:         yes (180 processes observed)
-Apache RAM Budget:      1434 MB (0.35 of total; source: tier)
-Avg httpd proc size:    12 MB
+Apache RAM Budget:      2867 MB (0.35 of total; source: tier)
+Avg httpd proc size:    10 MB
 ------------------------------------------------
 Current vs Proposed (prefork) (current => proposed):
-  ServerLimit           256          => 384
-  MaxRequestWorkers     256          => 384
-  StartServers          5            => 8
-  MinSpareServers       5            => 8
-  MaxSpareServers       10           => 16
+  ServerLimit           256          => 256
+  MaxRequestWorkers     256          => 256
+  StartServers          5            => 2
+  MinSpareServers       5            => 2
+  MaxSpareServers       10           => 8
   MaxConnectionsPerChild 0           => 4000
 ------------------------------------------------
 # BEGIN APACHE_SMART_TUNER
-# Apache Smart Tuner v1.17.0 (Tier: LOW-MID, MPM: prefork)
+# Apache Smart Tuner v1.18.0 (Tier: LOW-MID, MPM: prefork)
 Timeout 120
 KeepAlive On
 MaxKeepAliveRequests 100
 KeepAliveTimeout 5
 
 <IfModule prefork.c>
-    ServerLimit            384
-    MaxRequestWorkers      384
-    StartServers           8
-    MinSpareServers        8
-    MaxSpareServers        16
+    ServerLimit            256
+    MaxRequestWorkers      256
+    StartServers           2
+    MinSpareServers        2
+    MaxSpareServers        8
     MaxConnectionsPerChild 4000
 </IfModule>
 # END APACHE_SMART_TUNER
@@ -104,20 +104,20 @@ JSON output mirrors the same data structure for pipelines:
 
 ```json
 {
-  "version": "1.17.0",
+  "version": "1.18.0",
   "mode": "analyze",
   "mpm": "prefork",
   "tier": "LOW-MID",
-  "total_ram_mb": 4096,
+  "total_ram_mb": 8192,
   "cpu_cores": 4,
   "apache_running": true,
   "observed_processes": 180,
-  "avg_httpd_mb": 12,
-  "apache_budget_mb": 1434,
+  "avg_httpd_mb": 10,
+  "apache_budget_mb": 2867,
   "apache_budget_pct": 0.35,
   "apache_budget_source": "tier",
   "log_file": "/var/log/apache-smart-tuner.log",
-  "recommended_block": "# BEGIN APACHE_SMART_TUNER\n# Apache Smart Tuner v1.17.0 (Tier: LOW-MID, MPM: prefork)\nTimeout 120\nKeepAlive On\nMaxKeepAliveRequests 100\nKeepAliveTimeout 5\n\n<IfModule prefork.c>\n    ServerLimit            384\n    MaxRequestWorkers      384\n    StartServers           8\n    MinSpareServers        8\n    MaxSpareServers        16\n    MaxConnectionsPerChild 4000\n</IfModule>\n# END APACHE_SMART_TUNER\n",
+  "recommended_block": "# BEGIN APACHE_SMART_TUNER\n# Apache Smart Tuner v1.18.0 (Tier: LOW-MID, MPM: prefork)\nTimeout 120\nKeepAlive On\nMaxKeepAliveRequests 100\nKeepAliveTimeout 5\n\n<IfModule prefork.c>\n    ServerLimit            256\n    MaxRequestWorkers      256\n    StartServers           2\n    MinSpareServers        2\n    MaxSpareServers        8\n    MaxConnectionsPerChild 4000\n</IfModule>\n# END APACHE_SMART_TUNER\n",
   "current": {
     "ServerLimit": "256",
     "MaxRequestWorkers": "256",
@@ -130,14 +130,14 @@ JSON output mirrors the same data structure for pipelines:
     "MaxConnectionsPerChild": "0"
   },
   "recommended": {
-    "ServerLimit": "384",
-    "MaxRequestWorkers": "384",
+    "ServerLimit": "256",
+    "MaxRequestWorkers": "256",
     "ThreadsPerChild": "",
-    "StartServers": "8",
+    "StartServers": "2",
     "MinSpareThreads": "",
     "MaxSpareThreads": "",
-    "MinSpareServers": "8",
-    "MaxSpareServers": "16",
+    "MinSpareServers": "2",
+    "MaxSpareServers": "8",
     "MaxConnectionsPerChild": "4000"
   }
 }
@@ -150,7 +150,7 @@ JSON output mirrors the same data structure for pipelines:
 - **Reload control:** When Apache is running, the tuner reloads automatically unless `--no-reload` is set; if Apache is stopped, it writes the config and logs the pending start.
 
 ## Versioning
-The project follows semantic versioning. The current release is **1.17.0**.
+The project follows semantic versioning. The current release is **1.18.0**.
 
 ## License
 GPL-3.0-or-later. Authored by **Ryan MacDonald <ryan@rfxn.com>**.
