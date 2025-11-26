@@ -36,6 +36,7 @@ MODE="analyze"
 MODE_SET=0
 OUTPUT_FORMAT="text"
 RELOAD_AFTER_APPLY=1
+MPM_OVERRIDE=""
 
 set_mode() {
     local NEW_MODE="$1"
@@ -51,13 +52,14 @@ set_mode() {
 
 usage() {
     cat <<EOF
-Usage: $0 [--analyze] [--locate] [--apply] [--version] [--json] [--no-reload]
+Usage: $0 [--analyze] [--locate] [--apply] [--version] [--json] [--no-reload] [--mpm <type>]
 
   --analyze     (default) Print recommended Apache MPM config based on current RAM/cores
   --locate      Show which Apache config files currently define MPM-related directives
   --apply       Safely write/update recommended config into a cPanel include (or generic conf.d)
   --json        Emit analyze output as JSON for automation (mutually exclusive with --locate)
   --no-reload   Skip Apache reload/restart after successful --apply (writes config only)
+  --mpm <type>  Force MPM assumption (prefork|worker|event) when binary probing is unavailable
   --version     Display the current Apache Smart Tuner version and exit
 
 Notes:
@@ -89,6 +91,22 @@ while [[ $# -gt 0 ]]; do
             ;;
         --no-reload)
             RELOAD_AFTER_APPLY=0
+            ;;
+        --mpm)
+            if [[ -z "${2:-}" ]]; then
+                echo "ERROR: --mpm requires an argument (prefork|worker|event)"
+                exit 1
+            fi
+            case "$2" in
+                prefork|worker|event)
+                    MPM_OVERRIDE="$2"
+                    shift
+                    ;;
+                *)
+                    echo "ERROR: Unsupported MPM type for --mpm: $2"
+                    exit 1
+                    ;;
+            esac
             ;;
         --version)
             print_version
@@ -198,6 +216,8 @@ detect_cpanel() {
 }
 
 detect_mpm() {
+    [[ -n "$MPM_OVERRIDE" ]] && { MPM_TYPE="$MPM_OVERRIDE"; return; }
+
     local VOUT=""
     for bin in httpd apachectl apache2ctl; do
         if command -v "$bin" >/dev/null 2>&1; then
@@ -208,6 +228,11 @@ detect_mpm() {
 
     RAW_MPM=$(echo "$VOUT" | grep -i "Server MPM" | awk '{print $3}')
     MPM_TYPE=${RAW_MPM,,}
+
+    if [[ -z "$MPM_TYPE" || "$MPM_TYPE" == "" ]]; then
+        detect_apache_layout
+        MPM_TYPE=$(infer_mpm_from_config)
+    fi
 
     if [[ -z "$MPM_TYPE" ]]; then
         echo "ERROR: Unable to detect Apache MPM type."
@@ -260,6 +285,43 @@ detect_apache_process_name() {
     done
 
     APACHE_PROC_NAME="httpd"
+}
+
+infer_mpm_from_config() {
+    local SEARCH_PATHS=()
+
+    [[ -n "$HTTPD_CONF" && -f "$HTTPD_CONF" ]] && SEARCH_PATHS+=("$HTTPD_CONF")
+    [[ -d "$APACHE_ROOT/conf" ]] && SEARCH_PATHS+=("$APACHE_ROOT/conf")
+    [[ -d "$APACHE_ROOT/conf.d" ]] && SEARCH_PATHS+=("$APACHE_ROOT/conf.d")
+    [[ -n "$INCLUDES_DIR" && -d "$INCLUDES_DIR" ]] && SEARCH_PATHS+=("$INCLUDES_DIR")
+
+    if ((${#SEARCH_PATHS[@]} == 0)); then
+        echo ""
+        return
+    fi
+
+    local FIRST_MATCH
+    FIRST_MATCH=$(grep -R -h -E 'mpm_(prefork|worker|event)_module' "${SEARCH_PATHS[@]}" 2>/dev/null | head -n1)
+
+    if [[ -z "$FIRST_MATCH" ]]; then
+        FIRST_MATCH=$(grep -R -h -E '<IfModule[[:space:]]+mpm_(prefork|worker|event)_module>' "${SEARCH_PATHS[@]}" 2>/dev/null | head -n1)
+    fi
+
+    if [[ -n "$FIRST_MATCH" ]]; then
+        echo "$FIRST_MATCH" | awk '{
+            for (i=1; i<=NF; i++) {
+                if ($i ~ /mpm_(prefork|worker|event)_module/) {
+                    sub(/.*mpm_/, "", $i)
+                    sub(/_module.*/, "", $i)
+                    print tolower($i)
+                    break
+                }
+            }
+        }'
+        return
+    fi
+
+    echo ""
 }
 
 set_tier_params() {
@@ -785,12 +847,12 @@ print_current_vs_proposed() {
 
 # ----------------- main -----------------
 
+detect_apache_layout
+detect_cpanel
 detect_mpm
 detect_resources
 set_tier_params
 measure_apache_procs
-detect_apache_layout
-detect_cpanel
 get_current_values_with_precedence
 detect_configtest_cmd
 
