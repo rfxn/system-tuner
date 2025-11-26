@@ -1,6 +1,6 @@
 #!/bin/bash
 # ==============================================================================
-# Apache Smart Tuner v1.16.0 for cPanel / WHM & generic Apache
+# Apache Smart Tuner v1.16.1 for cPanel / WHM & generic Apache
 # Author: Ryan MacDonald <ryan@rfxn.com>
 # License: GPL-3.0-or-later
 #
@@ -26,13 +26,28 @@ set -u   # keep "undefined var" safety; avoid -e/pipefail to prevent silent exit
 
 VERSION_MAJOR=1
 VERSION_MINOR=16
-VERSION_PATCH=0
+VERSION_PATCH=1
 VERSION="${VERSION_MAJOR}.${VERSION_MINOR}.${VERSION_PATCH}"
 VERSION_NAME="Apache Smart Tuner v${VERSION}"
 
 LOG_FILE="/var/log/apache-smart-tuner.log"
 
 MODE="analyze"
+MODE_SET=0
+OUTPUT_FORMAT="text"
+RELOAD_AFTER_APPLY=1
+
+set_mode() {
+    local NEW_MODE="$1"
+
+    if [[ "$MODE_SET" -eq 1 && "$MODE" != "$NEW_MODE" ]]; then
+        echo "ERROR: Modes --$MODE and --$NEW_MODE cannot be combined."
+        exit 1
+    fi
+
+    MODE="$NEW_MODE"
+    MODE_SET=1
+}
 
 usage() {
     cat <<EOF
@@ -59,15 +74,15 @@ print_version() {
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --analyze)
-MODE="analyze"
-OUTPUT_FORMAT="text"
-RELOAD_AFTER_APPLY=1
+            set_mode "analyze"
+            OUTPUT_FORMAT="text"
+            RELOAD_AFTER_APPLY=1
             ;;
         --locate)
-            MODE="locate"
+            set_mode "locate"
             ;;
         --apply)
-            MODE="apply"
+            set_mode "apply"
             ;;
         --json)
             OUTPUT_FORMAT="json"

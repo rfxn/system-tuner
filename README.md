@@ -79,7 +79,7 @@ Current vs Proposed (prefork) (current => proposed):
   MaxConnectionsPerChild 0           => 4000
 ------------------------------------------------
 # BEGIN APACHE_SMART_TUNER
-# Apache Smart Tuner v1.16.0 (Tier: LOW-MID, MPM: prefork)
+# Apache Smart Tuner v1.16.1 (Tier: LOW-MID, MPM: prefork)
 Timeout 120
 KeepAlive On
 MaxKeepAliveRequests 100
@@ -101,7 +101,7 @@ JSON output mirrors the same data structure for pipelines:
 
 ```json
 {
-  "version": "1.16.0",
+  "version": "1.16.1",
   "mode": "analyze",
   "mpm": "prefork",
   "tier": "LOW-MID",
@@ -111,7 +111,7 @@ JSON output mirrors the same data structure for pipelines:
   "observed_processes": 180,
   "avg_httpd_mb": 12,
   "apache_budget_mb": 1434,
-  "recommended_block": "# BEGIN APACHE_SMART_TUNER\n# Apache Smart Tuner v1.16.0 (Tier: LOW-MID, MPM: prefork)\nTimeout 120\nKeepAlive On\nMaxKeepAliveRequests 100\nKeepAliveTimeout 5\n\n<IfModule prefork.c>\n    ServerLimit            384\n    MaxRequestWorkers      384\n    StartServers           8\n    MinSpareServers        8\n    MaxSpareServers        16\n    MaxConnectionsPerChild 4000\n</IfModule>\n# END APACHE_SMART_TUNER\n",
+  "recommended_block": "# BEGIN APACHE_SMART_TUNER\n# Apache Smart Tuner v1.16.1 (Tier: LOW-MID, MPM: prefork)\nTimeout 120\nKeepAlive On\nMaxKeepAliveRequests 100\nKeepAliveTimeout 5\n\n<IfModule prefork.c>\n    ServerLimit            384\n    MaxRequestWorkers      384\n    StartServers           8\n    MinSpareServers        8\n    MaxSpareServers        16\n    MaxConnectionsPerChild 4000\n</IfModule>\n# END APACHE_SMART_TUNER\n",
   "current": {
     "ServerLimit": "256",
     "MaxRequestWorkers": "256",
@@ -144,7 +144,7 @@ JSON output mirrors the same data structure for pipelines:
 - **Reload control:** When Apache is running, the tuner reloads automatically unless `--no-reload` is set; if Apache is stopped, it writes the config and logs the pending start.
 
 ## Versioning
-The project follows semantic versioning. The current release is **1.16.0**.
+The project follows semantic versioning. The current release is **1.16.1**.
 
 ## License
 GPL-3.0-or-later. Authored by **Ryan MacDonald <ryan@rfxn.com>**.
