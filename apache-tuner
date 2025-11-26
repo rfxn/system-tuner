@@ -653,10 +653,23 @@ locate_current_mpm_directives() {
         | sort -u || echo "  (none found)"
 }
 
+# Normalize values before printing to avoid control characters (e.g., \r)
+sanitize_value() {
+    local val="$1"
+    # Remove carriage returns/tabs that can arrive from config dumps
+    val=${val//$'\r'/}
+    val=${val//$'\t'/}
+    echo "$val"
+}
+
 print_current_vs_proposed() {
-    local label="$1"
-    local current="$2"
-    local proposed="$3"
+    local label
+    local current
+    local proposed
+
+    label=$(sanitize_value "$1")
+    current=$(sanitize_value "$2")
+    proposed=$(sanitize_value "$3")
     printf "  %-22s %-12s => %s\n" "$label" "$current" "$proposed"
 }
 
