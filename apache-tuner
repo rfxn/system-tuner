@@ -1,6 +1,8 @@
 #!/bin/bash
 # ==============================================================================
-# Apache Smart Tuner v14 for cPanel / WHM & generic Apache
+# Apache Smart Tuner v1.15.0 for cPanel / WHM & generic Apache
+# Author: Ryan MacDonald <ryan@rfxn.com>
+# License: GPL-3.0-or-later
 #
 # - Tiered by RAM & cores: LOW, LOW-MID, MID, HIGH
 # - PHP-aware: conservative CPU caps on MID/HIGH
@@ -22,25 +24,34 @@
 
 set -u   # keep "undefined var" safety; avoid -e/pipefail to prevent silent exits
 
+VERSION_MAJOR=1
+VERSION_MINOR=15
+VERSION_PATCH=0
+VERSION="${VERSION_MAJOR}.${VERSION_MINOR}.${VERSION_PATCH}"
+VERSION_NAME="Apache Smart Tuner v${VERSION}"
+
 LOG_FILE="/var/log/apache-smart-tuner.log"
 
 MODE="analyze"
-APPLY_FLAG=0
-LOCATE_FLAG=0
 
 usage() {
     cat <<EOF
-Usage: $0 [--analyze] [--locate] [--apply]
+Usage: $0 [--analyze] [--locate] [--apply] [--version]
 
   --analyze   (default) Print recommended Apache MPM config based on current RAM/cores
   --locate    Show which Apache config files currently define MPM-related directives
   --apply     Safely write/update recommended config into a cPanel include (or generic conf.d)
+  --version   Display the current Apache Smart Tuner version and exit
 
 Notes:
   - --apply must be run as root
   - On cPanel systems, the config will be written to the standard include locations
   - Backup files are created with .bk-YYYYmmddHHMMSS suffix
 EOF
+}
+
+print_version() {
+    echo "$VERSION_NAME"
 }
 
 while [[ $# -gt 0 ]]; do
@@ -50,11 +61,13 @@ while [[ $# -gt 0 ]]; do
             ;;
         --locate)
             MODE="locate"
-            LOCATE_FLAG=1
             ;;
         --apply)
             MODE="apply"
-            APPLY_FLAG=1
+            ;;
+        --version)
+            print_version
+            exit 0
             ;;
         -h|--help)
             usage
@@ -409,7 +422,7 @@ get_current_values_with_precedence() {
 
 build_recommended_block() {
     local HEADER COMMON
-    HEADER="# Apache Smart Tuner v14 (Tier: $TIER, MPM: $MPM_TYPE)\n"
+    HEADER="# ${VERSION_NAME} (Tier: $TIER, MPM: $MPM_TYPE)\n"
     COMMON="Timeout 120\nKeepAlive On\nMaxKeepAliveRequests 100\nKeepAliveTimeout 5\n\n"
 
     if [[ "$MPM_TYPE" == "prefork" ]]; then
@@ -640,6 +653,13 @@ locate_current_mpm_directives() {
         | sort -u || echo "  (none found)"
 }
 
+print_current_vs_proposed() {
+    local label="$1"
+    local current="$2"
+    local proposed="$3"
+    printf "  %-22s %-12s => %s\n" "$label" "$current" "$proposed"
+}
+
 # ----------------- main -----------------
 
 detect_mpm
@@ -670,20 +690,20 @@ echo "------------------------------------------------"
 echo "Current vs Proposed (${MPM_TYPE}) (current => proposed):"
 
 if [[ "$MPM_TYPE" == "prefork" ]]; then
-    echo "  ServerLimit            ${CUR_SERVER_LIMIT} => ${SERVER_LIMIT}"
-    echo "  MaxRequestWorkers      ${CUR_MAX_WORKERS} => ${MAX_WORKERS}"
-    echo "  StartServers           ${CUR_START_SERVERS} => ${START_SERVERS_ROUNDED}"
-    echo "  MinSpareServers        ${CUR_MIN_SPARE_SERVERS} => ${MIN_SPARE_SERVERS}"
-    echo "  MaxSpareServers        ${CUR_MAX_SPARE_SERVERS} => ${MAX_SPARE_SERVERS}"
-    echo "  MaxConnectionsPerChild ${CUR_MAX_CONN_PER_CHILD} => ${MAX_CONN_PER_CHILD}"
+    print_current_vs_proposed "ServerLimit" "$CUR_SERVER_LIMIT" "$SERVER_LIMIT"
+    print_current_vs_proposed "MaxRequestWorkers" "$CUR_MAX_WORKERS" "$MAX_WORKERS"
+    print_current_vs_proposed "StartServers" "$CUR_START_SERVERS" "$START_SERVERS_ROUNDED"
+    print_current_vs_proposed "MinSpareServers" "$CUR_MIN_SPARE_SERVERS" "$MIN_SPARE_SERVERS"
+    print_current_vs_proposed "MaxSpareServers" "$CUR_MAX_SPARE_SERVERS" "$MAX_SPARE_SERVERS"
+    print_current_vs_proposed "MaxConnectionsPerChild" "$CUR_MAX_CONN_PER_CHILD" "$MAX_CONN_PER_CHILD"
 else
-    echo "  ServerLimit            ${CUR_SERVER_LIMIT} => ${MAX_PROCS}"
-    echo "  MaxRequestWorkers      ${CUR_MAX_WORKERS} => ${MAX_WORKERS}"
-    echo "  ThreadsPerChild        ${CUR_THREADS_PER_CHILD} => ${THREADS_PER_CHILD}"
-    echo "  StartServers           ${CUR_START_SERVERS} => ${START_SERVERS_ROUNDED}"
-    echo "  MinSpareThreads        ${CUR_MIN_SPARE_THREADS} => ${MIN_SPARE_THREADS}"
-    echo "  MaxSpareThreads        ${CUR_MAX_SPARE_THREADS} => ${MAX_SPARE_THREADS}"
-    echo "  MaxConnectionsPerChild ${CUR_MAX_CONN_PER_CHILD} => ${MAX_CONN_PER_CHILD}"
+    print_current_vs_proposed "ServerLimit" "$CUR_SERVER_LIMIT" "$MAX_PROCS"
+    print_current_vs_proposed "MaxRequestWorkers" "$CUR_MAX_WORKERS" "$MAX_WORKERS"
+    print_current_vs_proposed "ThreadsPerChild" "$CUR_THREADS_PER_CHILD" "$THREADS_PER_CHILD"
+    print_current_vs_proposed "StartServers" "$CUR_START_SERVERS" "$START_SERVERS_ROUNDED"
+    print_current_vs_proposed "MinSpareThreads" "$CUR_MIN_SPARE_THREADS" "$MIN_SPARE_THREADS"
+    print_current_vs_proposed "MaxSpareThreads" "$CUR_MAX_SPARE_THREADS" "$MAX_SPARE_THREADS"
+    print_current_vs_proposed "MaxConnectionsPerChild" "$CUR_MAX_CONN_PER_CHILD" "$MAX_CONN_PER_CHILD"
 fi
 
 echo "------------------------------------------------"
