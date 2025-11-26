@@ -1,0 +1,651 @@
+#!/bin/bash
+# ==============================================================================
+# Apache Smart Tuner v14 for cPanel / WHM & generic Apache
+#
+# - Tiered by RAM & cores: LOW, LOW-MID, MID, HIGH
+# - PHP-aware: conservative CPU caps on MID/HIGH
+# - Floors:
+#     * Prefork:   ServerLimit / MaxRequestWorkers >= 128
+#     * Event/worker: MaxRequestWorkers >= 128 (threads)
+# - Doubles effective concurrency on LOW and LOW-MID tiers (within caps)
+# - Applies RAM, CPU, and tier-based global caps to MaxRequestWorkers
+# - Shows current vs proposed values (current => proposed)
+# - cPanel-aware:
+#     * prefers pre_virtualhost_global.conf if present for both apply and "Current" values
+#     * otherwise uses pre_main_global.conf (for apply)
+#     * runs /scripts/rebuildhttpdconf after changes
+# - Safe apply with backup and rollback
+# - --locate: list only conf files defining MPM / concurrency settings
+# - --apply: removes legacy prefork/worker/event/mpm_* IfModule blocks in target include,
+#            then writes a single Smart Tuner block for the active MPM
+# ==============================================================================
+
+set -u   # keep "undefined var" safety; avoid -e/pipefail to prevent silent exits
+
+MODE="analyze"
+APPLY_FLAG=0
+LOCATE_FLAG=0
+
+usage() {
+    cat <<EOF
+Usage: $0 [--analyze] [--locate] [--apply]
+
+  --analyze   (default) Print recommended Apache MPM config based on current RAM/cores
+  --locate    Show which Apache config files currently define MPM-related directives
+  --apply     Safely write/update recommended config into a cPanel include (or generic conf.d)
+
+Notes:
+  - --apply must be run as root
+  - On cPanel systems, the config will be written to the standard include locations
+  - Backup files are created with .bk-YYYYmmddHHMMSS suffix
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --analyze)
+            MODE="analyze"
+            ;;
+        --locate)
+            MODE="locate"
+            LOCATE_FLAG=1
+            ;;
+        --apply)
+            MODE="apply"
+            APPLY_FLAG=1
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "Unknown argument: $1"
+            usage
+            exit 1
+            ;;
+    esac
+    shift
+done
+
+# ----------------- helpers -----------------
+
+need_cmd() {
+    local CMD="$1"
+    if ! command -v "$CMD" >/dev/null 2>&1; then
+        echo "ERROR: Required command '$CMD' not found in PATH."
+        exit 1
+    fi
+}
+
+round_down_to_multiple_of_8() {
+    local VALUE=$1
+    local MULTIPLE=8
+
+    if [[ -z "$VALUE" || "$VALUE" -le 0 ]]; then
+        echo 1
+        return
+    fi
+
+    if [[ "$VALUE" -eq 1 || "$VALUE" -eq 2 ]]; then
+        echo "$VALUE"
+        return
+    fi
+
+    local REMAINDER=$(( VALUE % MULTIPLE ))
+    local NEW_VALUE=$(( VALUE - REMAINDER ))
+
+    if [[ "$NEW_VALUE" -lt 1 ]]; then
+        echo "$MULTIPLE"
+    else
+        echo "$NEW_VALUE"
+    fi
+}
+
+# ----------------- Apache layout / env detection -----------------
+
+detect_apache_layout() {
+    APACHE_ROOT=""
+    HTTPD_CONF=""
+    INCLUDES_DIR=""
+    PREFORK_INCLUDE=""
+
+    if [[ -f /etc/apache2/conf/httpd.conf ]]; then
+        APACHE_ROOT="/etc/apache2"
+        HTTPD_CONF="/etc/apache2/conf/httpd.conf"
+        INCLUDES_DIR="/etc/apache2/conf.d/includes"
+        PREFORK_INCLUDE="$APACHE_ROOT/conf.d/includes/pre_virtualhost_global.conf"
+        [[ ! -f "$PREFORK_INCLUDE" && -f "$APACHE_ROOT/conf/includes/pre_virtualhost_global.conf" ]] && PREFORK_INCLUDE="$APACHE_ROOT/conf/includes/pre_virtualhost_global.conf"
+    elif [[ -f /usr/local/apache/conf/httpd.conf ]]; then
+        APACHE_ROOT="/usr/local/apache"
+        HTTPD_CONF="/usr/local/apache/conf/httpd.conf"
+        INCLUDES_DIR="/usr/local/apache/conf/includes"
+        PREFORK_INCLUDE="$APACHE_ROOT/conf/includes/pre_virtualhost_global.conf"
+    elif [[ -f /etc/httpd/conf/httpd.conf ]]; then
+        APACHE_ROOT="/etc/httpd"
+        HTTPD_CONF="/etc/httpd/conf/httpd.conf"
+        INCLUDES_DIR="/etc/httpd/conf.d"
+        PREFORK_INCLUDE="$APACHE_ROOT/conf.d/pre_virtualhost_global.conf"
+    fi
+
+    if [[ -z "$APACHE_ROOT" || -z "$HTTPD_CONF" ]]; then
+        echo "ERROR: Could not detect Apache config layout."
+        exit 1
+    fi
+}
+
+detect_cpanel() {
+    if [[ -d /usr/local/cpanel || -d /etc/cpanel ]]; then
+        IS_CPANEL=1
+    else
+        IS_CPANEL=0
+    fi
+}
+
+detect_mpm() {
+    local VOUT=""
+    if command -v httpd >/dev/null 2>&1; then
+        VOUT=$(httpd -V 2>/dev/null || true)
+    fi
+    if [[ -z "$VOUT" && "$(command -v apachectl || echo)" != "" ]]; then
+        VOUT=$(apachectl -V 2>/dev/null || true)
+    fi
+
+    RAW_MPM=$(echo "$VOUT" | grep -i "Server MPM" | awk '{print $3}')
+    MPM_TYPE=${RAW_MPM,,}
+
+    if [[ -z "$MPM_TYPE" ]]; then
+        echo "ERROR: Unable to detect Apache MPM type."
+        exit 1
+    fi
+    case "$MPM_TYPE" in
+        prefork|worker|event) ;;
+        *)
+            echo "ERROR: Unsupported or unknown MPM type detected: $MPM_TYPE"
+            exit 1
+            ;;
+    esac
+}
+
+detect_resources() {
+    need_cmd free
+    need_cmd nproc
+    need_cmd ps
+    need_cmd bc
+
+    TOTAL_MEM=$(free -m | awk '/^Mem:/{print $2}')
+    CORES=$(nproc)
+
+    if [[ -z "$TOTAL_MEM" || -z "$CORES" ]]; then
+        echo "ERROR: Unable to detect RAM or CPU core count."
+        exit 1
+    fi
+}
+
+set_tier_params() {
+    if [[ "$TOTAL_MEM" -le 2048 || "$CORES" -le 2 ]]; then
+        TIER="LOW"
+        APACHE_PCT="0.30"
+        PROCS_PER_CORE_CAP=64
+        THREADS_PER_CORE_CAP=200
+        START_SERVERS=1
+        MIN_SPARE=1
+        MAX_SPARE=2
+        MAX_CONN_PER_CHILD=2000
+        MRW_CAP_PREFORK=256
+        MRW_CAP_THREADED=512
+    elif [[ "$TOTAL_MEM" -le 8192 && "$CORES" -ge 2 ]]; then
+        TIER="LOW-MID"
+        APACHE_PCT="0.35"
+        PROCS_PER_CORE_CAP=64
+        THREADS_PER_CORE_CAP=220
+        START_SERVERS=2
+        MIN_SPARE=2
+        MAX_SPARE=5
+        MAX_CONN_PER_CHILD=4000
+        MRW_CAP_PREFORK=512
+        MRW_CAP_THREADED=2000
+    elif [[ "$TOTAL_MEM" -le 16384 && "$CORES" -ge 4 ]]; then
+        TIER="MID"
+        APACHE_PCT="0.40"
+        PROCS_PER_CORE_CAP=48
+        THREADS_PER_CORE_CAP=200
+        START_SERVERS=3
+        MIN_SPARE=3
+        MAX_SPARE=8
+        MAX_CONN_PER_CHILD=8000
+        MRW_CAP_PREFORK=800
+        MRW_CAP_THREADED=6000
+    else
+        TIER="HIGH"
+        APACHE_PCT="0.45"
+        PROCS_PER_CORE_CAP=40
+        THREADS_PER_CORE_CAP=200
+        START_SERVERS=4
+        MIN_SPARE=5
+        MAX_SPARE=12
+        MAX_CONN_PER_CHILD=10000
+        MRW_CAP_PREFORK=1600
+        MRW_CAP_THREADED=12000
+    fi
+}
+
+measure_apache_procs() {
+    APACHE_PROCS=$(ps -C httpd -o rss= 2>/dev/null | wc -l || echo 0)
+    AVG_PROC_MB=$(ps -C httpd -o rss= 2>/dev/null | awk '{sum+=$1; n++} END { if(n>0) printf "%.0f", sum/n/1024; else print 0 }')
+
+    if [[ -z "$AVG_PROC_MB" || "$AVG_PROC_MB" -le 0 ]]; then
+        if [[ "$MPM_TYPE" == "prefork" ]]; then
+            AVG_PROC_MB=35
+        else
+            AVG_PROC_MB=15
+        fi
+    fi
+
+    APACHE_BUDGET_MB=$(echo "$TOTAL_MEM * $APACHE_PCT" | bc | awk '{printf "%.0f", $0}')
+}
+
+apache_configtest() {
+    if command -v apachectl >/dev/null 2>&1; then
+        apachectl configtest
+    elif command -v httpd >/dev/null 2>&1; then
+        httpd -t
+    else
+        echo "ERROR: Neither apachectl nor httpd found for configtest."
+        return 1
+    fi
+}
+
+# ----------------- current config parsing -----------------
+
+parse_file_for_directives() {
+    local FILE="$1"
+    [[ ! -f "$FILE" ]] && return
+
+    while IFS= read -r line; do
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        local clean
+        clean=$(echo "$line" | sed -e 's/^[[:space:]]*//')
+
+        case "$clean" in
+            ServerLimit*)
+                [[ -z "${CUR_SERVER_LIMIT:-}" || "$CUR_SERVER_LIMIT" == "unknown" ]] \
+                    && CUR_SERVER_LIMIT=$(echo "$clean" | awk '{print $2}')
+                ;;
+            MaxRequestWorkers*|MaxClients*)
+                [[ -z "${CUR_MAX_WORKERS:-}" || "$CUR_MAX_WORKERS" == "unknown" ]] \
+                    && CUR_MAX_WORKERS=$(echo "$clean" | awk '{print $2}')
+                ;;
+            StartServers*)
+                [[ -z "${CUR_START_SERVERS:-}" || "$CUR_START_SERVERS" == "unknown" ]] \
+                    && CUR_START_SERVERS=$(echo "$clean" | awk '{print $2}')
+                ;;
+            MinSpareServers*)
+                [[ -z "${CUR_MIN_SPARE_SERVERS:-}" || "$CUR_MIN_SPARE_SERVERS" == "unknown" ]] \
+                    && CUR_MIN_SPARE_SERVERS=$(echo "$clean" | awk '{print $2}')
+                ;;
+            MaxSpareServers*)
+                [[ -z "${CUR_MAX_SPARE_SERVERS:-}" || "$CUR_MAX_SPARE_SERVERS" == "unknown" ]] \
+                    && CUR_MAX_SPARE_SERVERS=$(echo "$clean" | awk '{print $2}')
+                ;;
+            MinSpareThreads*)
+                [[ -z "${CUR_MIN_SPARE_THREADS:-}" || "$CUR_MIN_SPARE_THREADS" == "unknown" ]] \
+                    && CUR_MIN_SPARE_THREADS=$(echo "$clean" | awk '{print $2}')
+                ;;
+            MaxSpareThreads*)
+                [[ -z "${CUR_MAX_SPARE_THREADS:-}" || "$CUR_MAX_SPARE_THREADS" == "unknown" ]] \
+                    && CUR_MAX_SPARE_THREADS=$(echo "$clean" | awk '{print $2}')
+                ;;
+            ThreadsPerChild*)
+                [[ -z "${CUR_THREADS_PER_CHILD:-}" || "$CUR_THREADS_PER_CHILD" == "unknown" ]] \
+                    && CUR_THREADS_PER_CHILD=$(echo "$clean" | awk '{print $2}')
+                ;;
+            MaxConnectionsPerChild*|MaxRequestsPerChild*)
+                [[ -z "${CUR_MAX_CONN_PER_CHILD:-}" || "$CUR_MAX_CONN_PER_CHILD" == "unknown" ]] \
+                    && CUR_MAX_CONN_PER_CHILD=$(echo "$clean" | awk '{print $2}')
+                ;;
+        esac
+    done < <(grep -E 'ServerLimit|MaxRequestWorkers|MaxClients|StartServers|MinSpareServers|MaxSpareServers|MinSpareThreads|MaxSpareThreads|ThreadsPerChild|MaxConnectionsPerChild|MaxRequestsPerChild' "$FILE" 2>/dev/null || true)
+}
+
+get_current_values_with_precedence() {
+    CUR_SERVER_LIMIT=""
+    CUR_MAX_WORKERS=""
+    CUR_THREADS_PER_CHILD=""
+    CUR_START_SERVERS=""
+    CUR_MIN_SPARE_THREADS=""
+    CUR_MAX_SPARE_THREADS=""
+    CUR_MIN_SPARE_SERVERS=""
+    CUR_MAX_SPARE_SERVERS=""
+    CUR_MAX_CONN_PER_CHILD=""
+
+    detect_apache_layout
+    detect_cpanel
+
+    # 1) cPanel include wins
+    if [[ "$IS_CPANEL" -eq 1 && -n "${PREFORK_INCLUDE:-}" && -f "$PREFORK_INCLUDE" ]]; then
+        parse_file_for_directives "$PREFORK_INCLUDE"
+    fi
+
+    # 2) Runtime (DUMP_RUN_CFG) fills blanks
+    local CURRENT_DUMP=""
+    if command -v apachectl >/dev/null 2>&1; then
+        CURRENT_DUMP=$(apachectl -t -D DUMP_RUN_CFG 2>/dev/null || true)
+    elif command -v httpd >/dev/null 2>&1; then
+        CURRENT_DUMP=$(httpd -t -D DUMP_RUN_CFG 2>/dev/null || true)
+    fi
+
+    if [[ -n "$CURRENT_DUMP" ]] && echo "$CURRENT_DUMP" | grep -q "ServerLimit:" 2>/dev/null; then
+        [[ -z "$CUR_SERVER_LIMIT" || "$CUR_SERVER_LIMIT" == "unknown" ]] \
+            && CUR_SERVER_LIMIT=$(echo "$CURRENT_DUMP" | awk '/ServerLimit:/ {print $2; exit}')
+        local _mrw
+        _mrw=$(echo "$CURRENT_DUMP" | awk '/MaxRequestWorkers:/ {print $2; found=1} /MaxClients:/ && !found {print $2; found=1} END {if(!found) print ""}')
+        [[ -n "$_mrw" && ( -z "$CUR_MAX_WORKERS" || "$CUR_MAX_WORKERS" == "unknown" ) ]] && CUR_MAX_WORKERS="$_mrw"
+        [[ -z "$CUR_THREADS_PER_CHILD" || "$CUR_THREADS_PER_CHILD" == "unknown" ]] \
+            && CUR_THREADS_PER_CHILD=$(echo "$CURRENT_DUMP" | awk '/ThreadsPerChild:/ {print $2; exit}')
+        [[ -z "$CUR_START_SERVERS" || "$CUR_START_SERVERS" == "unknown" ]] \
+            && CUR_START_SERVERS=$(echo "$CURRENT_DUMP" | awk '/StartServers:/ {print $2; exit}')
+        [[ -z "$CUR_MIN_SPARE_THREADS" || "$CUR_MIN_SPARE_THREADS" == "unknown" ]] \
+            && CUR_MIN_SPARE_THREADS=$(echo "$CURRENT_DUMP" | awk '/MinSpareThreads:/ {print $2; exit}')
+        [[ -z "$CUR_MAX_SPARE_THREADS" || "$CUR_MAX_SPARE_THREADS" == "unknown" ]] \
+            && CUR_MAX_SPARE_THREADS=$(echo "$CURRENT_DUMP" | awk '/MaxSpareThreads:/ {print $2; exit}')
+        [[ -z "$CUR_MIN_SPARE_SERVERS" || "$CUR_MIN_SPARE_SERVERS" == "unknown" ]] \
+            && CUR_MIN_SPARE_SERVERS=$(echo "$CURRENT_DUMP" | awk '/MinSpareServers:/ {print $2; exit}')
+        [[ -z "$CUR_MAX_SPARE_SERVERS" || "$CUR_MAX_SPARE_SERVERS" == "unknown" ]] \
+            && CUR_MAX_SPARE_SERVERS=$(echo "$CURRENT_DUMP" | awk '/MaxSpareServers:/ {print $2; exit}')
+        local _mcp
+        _mcp=$(echo "$CURRENT_DUMP" | awk '/MaxConnectionsPerChild:/ {print $2; found=1} /MaxRequestsPerChild:/ && !found {print $2; found=1} END {if(!found) print ""}')
+        [[ -n "$_mcp" && ( -z "$CUR_MAX_CONN_PER_CHILD" || "$CUR_MAX_CONN_PER_CHILD" == "unknown" ) ]] && CUR_MAX_CONN_PER_CHILD="$_mcp"
+    fi
+
+    # 3) httpd.conf as last fallback
+    parse_file_for_directives "$HTTPD_CONF"
+
+    : "${CUR_SERVER_LIMIT:=unknown}"
+    : "${CUR_MAX_WORKERS:=unknown}"
+    : "${CUR_THREADS_PER_CHILD:=unknown}"
+    : "${CUR_START_SERVERS:=unknown}"
+    : "${CUR_MIN_SPARE_THREADS:=unknown}"
+    : "${CUR_MAX_SPARE_THREADS:=unknown}"
+    : "${CUR_MIN_SPARE_SERVERS:=unknown}"
+    : "${CUR_MAX_SPARE_SERVERS:=unknown}"
+    : "${CUR_MAX_CONN_PER_CHILD:=unknown}"
+}
+
+# ----------------- recommendation logic -----------------
+
+build_recommended_block() {
+    local HEADER COMMON
+    HEADER="# Apache Smart Tuner v14 (Tier: $TIER, MPM: $MPM_TYPE)\n"
+    COMMON="Timeout 120\nKeepAlive On\nMaxKeepAliveRequests 100\nKeepAliveTimeout 5\n\n"
+
+    if [[ "$MPM_TYPE" == "prefork" ]]; then
+        RAW_MAX_WORKERS=$(echo "$APACHE_BUDGET_MB / $AVG_PROC_MB" | bc | awk '{printf "%.0f", $0}')
+        [[ -z "$RAW_MAX_WORKERS" ]] && RAW_MAX_WORKERS=32
+
+        if [[ "$TIER" == "LOW" || "$TIER" == "LOW-MID" ]]; then
+            RAW_MAX_WORKERS=$(( RAW_MAX_WORKERS * 2 ))
+        fi
+
+        CPU_CAP=$(( CORES * PROCS_PER_CORE_CAP ))
+        (( CPU_CAP < 128 )) && CPU_CAP=128
+        (( RAW_MAX_WORKERS > CPU_CAP )) && RAW_MAX_WORKERS=$CPU_CAP
+
+        MAX_WORKERS=$(round_down_to_multiple_of_8 "$RAW_MAX_WORKERS")
+        (( MAX_WORKERS > MRW_CAP_PREFORK )) && MAX_WORKERS=$MRW_CAP_PREFORK
+        (( MAX_WORKERS < 128 )) && MAX_WORKERS=128
+
+        SERVER_LIMIT=$MAX_WORKERS
+        MIN_SPARE_SERVERS=$(round_down_to_multiple_of_8 "$MIN_SPARE")
+        MAX_SPARE_SERVERS=$(round_down_to_multiple_of_8 "$MAX_SPARE")
+        START_SERVERS_ROUNDED=$(round_down_to_multiple_of_8 "$START_SERVERS")
+
+        (( MAX_SPARE_SERVERS > MAX_WORKERS )) && MAX_SPARE_SERVERS=$MAX_WORKERS
+        (( MIN_SPARE_SERVERS > MAX_WORKERS )) && MIN_SPARE_SERVERS=$MAX_WORKERS
+        (( MIN_SPARE_SERVERS > MAX_SPARE_SERVERS )) && MIN_SPARE_SERVERS=$MAX_SPARE_SERVERS
+
+        PREFORK_BLOCK="<IfModule prefork.c>\n"
+        PREFORK_BLOCK+="    ServerLimit            $SERVER_LIMIT\n"
+        PREFORK_BLOCK+="    MaxRequestWorkers      $MAX_WORKERS\n"
+        PREFORK_BLOCK+="    StartServers           $START_SERVERS_ROUNDED\n"
+        PREFORK_BLOCK+="    MinSpareServers        $MIN_SPARE_SERVERS\n"
+        PREFORK_BLOCK+="    MaxSpareServers        $MAX_SPARE_SERVERS\n"
+        PREFORK_BLOCK+="    MaxConnectionsPerChild $MAX_CONN_PER_CHILD\n"
+        PREFORK_BLOCK+="</IfModule>\n"
+
+        RECOMMENDED_BLOCK="# BEGIN APACHE_SMART_TUNER\n${HEADER}${COMMON}${PREFORK_BLOCK}# END APACHE_SMART_TUNER\n"
+
+    else
+        THREADS_PER_CHILD=25
+
+        RAW_MAX_PROCS=$(echo "$APACHE_BUDGET_MB / $AVG_PROC_MB" | bc | awk '{printf "%.0f", $0}')
+        [[ -z "$RAW_MAX_PROCS" ]] && RAW_MAX_PROCS=8
+
+        if [[ "$TIER" == "LOW" || "$TIER" == "LOW-MID" ]]; then
+            RAW_MAX_PROCS=$(( RAW_MAX_PROCS * 2 ))
+        fi
+
+        CPU_THREAD_CAP=$(( CORES * THREADS_PER_CORE_CAP ))
+        CPU_PROC_CAP=$(( CPU_THREAD_CAP / THREADS_PER_CHILD ))
+        (( RAW_MAX_PROCS > CPU_PROC_CAP )) && RAW_MAX_PROCS=$CPU_PROC_CAP
+
+        MAX_PROCS=$(round_down_to_multiple_of_8 "$RAW_MAX_PROCS")
+        (( MAX_PROCS < 1 )) && MAX_PROCS=1
+
+        MAX_WORKERS=$(( MAX_PROCS * THREADS_PER_CHILD ))
+        (( MAX_WORKERS > MRW_CAP_THREADED )) && MAX_WORKERS=$MRW_CAP_THREADED
+        (( MAX_WORKERS < 128 )) && MAX_WORKERS=128
+
+        MAX_PROCS=$(( (MAX_WORKERS + THREADS_PER_CHILD - 1) / THREADS_PER_CHILD ))
+        MAX_PROCS=$(round_down_to_multiple_of_8 "$MAX_PROCS")
+        (( MAX_PROCS < 1 )) && MAX_PROCS=1
+        MAX_WORKERS=$(( MAX_PROCS * THREADS_PER_CHILD ))
+
+        MIN_SPARE_THREADS=$(( MIN_SPARE * THREADS_PER_CHILD ))
+        MAX_SPARE_THREADS=$(( MAX_SPARE * THREADS_PER_CHILD ))
+
+        MIN_SPARE_THREADS=$(round_down_to_multiple_of_8 "$MIN_SPARE_THREADS")
+        MAX_SPARE_THREADS=$(round_down_to_multiple_of_8 "$MAX_SPARE_THREADS")
+        START_SERVERS_ROUNDED=$(round_down_to_multiple_of_8 "$START_SERVERS")
+
+        (( MAX_SPARE_THREADS > MAX_WORKERS )) && MAX_SPARE_THREADS=$MAX_WORKERS
+        (( MIN_SPARE_THREADS > MAX_WORKERS )) && MIN_SPARE_THREADS=$MAX_WORKERS
+        (( MIN_SPARE_THREADS > MAX_SPARE_THREADS )) && MIN_SPARE_THREADS=$MAX_SPARE_THREADS
+
+        MPM_BLOCK="<IfModule mpm_${MPM_TYPE}_module>\n"
+        MPM_BLOCK+="    ServerLimit            $MAX_PROCS\n"
+        MPM_BLOCK+="    StartServers           $START_SERVERS_ROUNDED\n"
+        MPM_BLOCK+="    MaxRequestWorkers      $MAX_WORKERS\n"
+        MPM_BLOCK+="    ThreadsPerChild        $THREADS_PER_CHILD\n"
+        MPM_BLOCK+="    MinSpareThreads        $MIN_SPARE_THREADS\n"
+        MPM_BLOCK+="    MaxSpareThreads        $MAX_SPARE_THREADS\n"
+        MPM_BLOCK+="    MaxConnectionsPerChild $MAX_CONN_PER_CHILD\n"
+        MPM_BLOCK+="</IfModule>\n"
+
+        RECOMMENDED_BLOCK="# BEGIN APACHE_SMART_TUNER\n${HEADER}${COMMON}${MPM_BLOCK}# END APACHE_SMART_TUNER\n"
+    fi
+}
+
+# ----------------- apply config safely -----------------
+
+apply_recommended_config() {
+    if [[ "$EUID" -ne 0 ]]; then
+        echo "ERROR: --apply must be run as root."
+        exit 1
+    fi
+
+    detect_apache_layout
+    detect_cpanel
+
+    echo "Running preflight Apache configtest..."
+    if ! apache_configtest; then
+        echo "ERROR: Apache configtest FAILED before making changes."
+        exit 1
+    fi
+
+    if [[ "$IS_CPANEL" -eq 1 && -d "$INCLUDES_DIR" ]]; then
+        if [[ -n "${PREFORK_INCLUDE:-}" && -f "$PREFORK_INCLUDE" ]]; then
+            TARGET_FILE="$PREFORK_INCLUDE"
+        else
+            TARGET_FILE="${INCLUDES_DIR}/pre_main_global.conf"
+        fi
+    else
+        mkdir -p "$INCLUDES_DIR"
+        TARGET_FILE="${INCLUDES_DIR}/apache-smart-tuner.conf"
+    fi
+
+    [[ ! -f "$TARGET_FILE" ]] && touch "$TARGET_FILE"
+
+    local TS BACKUP_FILE
+    TS=$(date +%Y%m%d%H%M%S)
+    BACKUP_FILE="${TARGET_FILE}.bk-${TS}"
+    cp -p "$TARGET_FILE" "$BACKUP_FILE"
+    echo "Backup created at: $BACKUP_FILE"
+
+    local tmpfile
+    tmpfile=$(mktemp)
+    awk '
+        BEGIN {
+            in_tuner = 0;
+            in_prefork = 0;
+            in_worker = 0;
+            in_event = 0;
+            in_mpm = 0;
+        }
+        /BEGIN APACHE_SMART_TUNER/ { in_tuner=1; next }
+        /END APACHE_SMART_TUNER/   { in_tuner=0; next }
+
+        /<IfModule[[:space:]]+prefork\.c>/         { in_prefork=1; next }
+        /<IfModule[[:space:]]+worker\.c>/          { in_worker=1;  next }
+        /<IfModule[[:space:]]+event\.c>/           { in_event=1;   next }
+        /<IfModule[[:space:]]+mpm_(prefork|worker|event)_module>/ { in_mpm=1; next }
+
+        /<\/IfModule>/ {
+            if (in_prefork || in_worker || in_event || in_mpm) {
+                in_prefork=0; in_worker=0; in_event=0; in_mpm=0;
+                next;
+            }
+        }
+
+        in_tuner || in_prefork || in_worker || in_event || in_mpm { next }
+
+        { print }
+    ' "$TARGET_FILE" > "$tmpfile"
+
+    mv "$tmpfile" "$TARGET_FILE"
+    printf "%b" "$RECOMMENDED_BLOCK" >> "$TARGET_FILE"
+
+    if [[ "$IS_CPANEL" -eq 1 && -x /scripts/rebuildhttpdconf ]]; then
+        echo "Detected cPanel. Running /scripts/rebuildhttpdconf..."
+        /scripts/rebuildhttpdconf
+    fi
+
+    echo "Running Apache configtest after applying changes..."
+    if ! apache_configtest; then
+        echo "ERROR: Apache configtest FAILED after applying changes."
+        echo "Restoring backup: $BACKUP_FILE"
+        cp -p "$BACKUP_FILE" "$TARGET_FILE"
+        if [[ "$IS_CPANEL" -eq 1 && -x /scripts/rebuildhttpdconf ]]; then
+            /scripts/rebuildhttpdconf
+        fi
+        apache_configtest || echo "WARNING: Apache config still failing after rollback; manual intervention required."
+        exit 1
+    fi
+
+    echo "Configtest PASSED. Reloading Apache..."
+    if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files | grep -q httpd; then
+        systemctl reload httpd || systemctl restart httpd
+    elif command -v service >/dev/null 2>&1; then
+        service httpd reload || service httpd restart
+    else
+        apachectl graceful || apachectl restart
+    fi
+
+    echo "Apache Smart Tuner: configuration successfully applied."
+}
+
+# ----------------- locate directives (QUIET) -----------------
+
+locate_current_mpm_directives() {
+    detect_apache_layout
+
+    local SEARCH_DIRS=()
+    [[ -d "$APACHE_ROOT/conf" ]]   && SEARCH_DIRS+=("$APACHE_ROOT/conf")
+    [[ -d "$APACHE_ROOT/conf.d" ]] && SEARCH_DIRS+=("$APACHE_ROOT/conf.d")
+    [[ -n "$INCLUDES_DIR" && -d "$INCLUDES_DIR" ]] && SEARCH_DIRS+=("$INCLUDES_DIR")
+
+    if ((${#SEARCH_DIRS[@]} == 0)); then
+        echo "No Apache config directories found to search."
+        return
+    fi
+
+    echo "Apache config search roots:"
+    for d in "${SEARCH_DIRS[@]}"; do
+        echo "  $d"
+    done
+    echo
+
+    echo "Files defining MPM modules (prefork/worker/event):"
+    grep -RIlE 'mpm_(prefork|worker|event)_module|prefork.c' "${SEARCH_DIRS[@]}" 2>/dev/null \
+        | grep -E '\.conf(\.|$)' \
+        | sort -u || echo "  (none found)"
+    echo
+
+    echo "Files defining concurrency / spare settings:"
+    grep -RIlE 'ServerLimit|MaxRequestWorkers|MaxClients|ThreadsPerChild|MinSpareThreads|MaxSpareThreads|MinSpareServers|MaxSpareServers|MaxRequestsPerChild|MaxConnectionsPerChild' "${SEARCH_DIRS[@]}" 2>/dev/null \
+        | grep -E '\.conf(\.|$)' \
+        | sort -u || echo "  (none found)"
+}
+
+# ----------------- main -----------------
+
+detect_mpm
+detect_resources
+set_tier_params
+measure_apache_procs
+detect_apache_layout
+detect_cpanel
+get_current_values_with_precedence
+
+if [[ "$MODE" == "locate" ]]; then
+    locate_current_mpm_directives
+    exit 0
+fi
+
+build_recommended_block
+
+echo "------------------------------------------------"
+echo " Apache Smart Tuner Analysis"
+echo "------------------------------------------------"
+echo "Detected MPM:           $MPM_TYPE"
+echo "Tier:                   $TIER"
+echo "Total RAM:              ${TOTAL_MEM} MB"
+echo "CPU Cores:              ${CORES}"
+echo "Apache RAM Budget:      ${APACHE_BUDGET_MB} MB (${APACHE_PCT} of total)"
+echo "Avg httpd proc size:    ${AVG_PROC_MB} MB"
+echo "------------------------------------------------"
+echo "Current vs Proposed (${MPM_TYPE}) (current => proposed):"
+
+if [[ "$MPM_TYPE" == "prefork" ]]; then
+    echo "  ServerLimit            ${CUR_SERVER_LIMIT} => ${SERVER_LIMIT}"
+    echo "  MaxRequestWorkers      ${CUR_MAX_WORKERS} => ${MAX_WORKERS}"
+    echo "  StartServers           ${CUR_START_SERVERS} => ${START_SERVERS_ROUNDED}"
+    echo "  MinSpareServers        ${CUR_MIN_SPARE_SERVERS} => ${MIN_SPARE_SERVERS}"
+    echo "  MaxSpareServers        ${CUR_MAX_SPARE_SERVERS} => ${MAX_SPARE_SERVERS}"
+    echo "  MaxConnectionsPerChild ${CUR_MAX_CONN_PER_CHILD} => ${MAX_CONN_PER_CHILD}"
+else
+    echo "  ServerLimit            ${CUR_SERVER_LIMIT} => ${MAX_PROCS}"
+    echo "  MaxRequestWorkers      ${CUR_MAX_WORKERS} => ${MAX_WORKERS}"
+    echo "  ThreadsPerChild        ${CUR_THREADS_PER_CHILD} => ${THREADS_PER_CHILD}"
+    echo "  StartServers           ${CUR_START_SERVERS} => ${START_SERVERS_ROUNDED}"
+    echo "  MinSpareThreads        ${CUR_MIN_SPARE_THREADS} => ${MIN_SPARE_THREADS}"
+    echo "  MaxSpareThreads        ${CUR_MAX_SPARE_THREADS} => ${MAX_SPARE_THREADS}"
+    echo "  MaxConnectionsPerChild ${CUR_MAX_CONN_PER_CHILD} => ${MAX_CONN_PER_CHILD}"
+fi
+
+echo "------------------------------------------------"
+echo -e "$RECOMMENDED_BLOCK"
+echo "------------------------------------------------"
+
+if [[ "$MODE" == "apply" ]]; then
+    apply_recommended_config
+fi
