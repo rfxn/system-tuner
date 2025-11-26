@@ -28,7 +28,11 @@ Apache Smart Tuner is a lightweight Bash utility that inspects an Apache host an
   ```
 
 ## Versioning
-Apache Smart Tuner now follows semantic versioning. The current release is **1.15.0**, reflecting the fifteenth iteration of the tuner within a structured MAJOR.MINOR.PATCH scheme.
+Apache Smart Tuner now follows semantic versioning. The current release is **1.16.0**, reflecting the sixteenth iteration of the tuner within a structured MAJOR.MINOR.PATCH scheme.
+
+## What's new in 1.16.0
+- Detects whether Apache is currently running and reports the observed process count during analysis.
+- Skips reloads when Apache is stopped while still applying configuration safely, prompting an administrator to start the service manually.
 
 ## License and attribution
 Apache Smart Tuner is licensed under the GPL-3.0-or-later. Authored by **Ryan MacDonald <ryan@rfxn.com>**.

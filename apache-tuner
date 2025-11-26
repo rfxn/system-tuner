@@ -1,6 +1,6 @@
 #!/bin/bash
 # ==============================================================================
-# Apache Smart Tuner v1.15.0 for cPanel / WHM & generic Apache
+# Apache Smart Tuner v1.16.0 for cPanel / WHM & generic Apache
 # Author: Ryan MacDonald <ryan@rfxn.com>
 # License: GPL-3.0-or-later
 #
@@ -25,7 +25,7 @@
 set -u   # keep "undefined var" safety; avoid -e/pipefail to prevent silent exits
 
 VERSION_MAJOR=1
-VERSION_MINOR=15
+VERSION_MINOR=16
 VERSION_PATCH=0
 VERSION="${VERSION_MAJOR}.${VERSION_MINOR}.${VERSION_PATCH}"
 VERSION_NAME="Apache Smart Tuner v${VERSION}"
@@ -278,6 +278,9 @@ measure_apache_procs() {
     detect_apache_process_name
 
     APACHE_PROCS=$(ps -C "$APACHE_PROC_NAME" -o rss= 2>/dev/null | wc -l || echo 0)
+    APACHE_RUNNING=0
+    [[ "$APACHE_PROCS" -gt 0 ]] && APACHE_RUNNING=1
+
     AVG_PROC_MB=$(ps -C "$APACHE_PROC_NAME" -o rss= 2>/dev/null | awk '{sum+=$1; n++} END { if(n>0) printf "%.0f", sum/n/1024; else print 0 }')
 
     if [[ -z "$AVG_PROC_MB" || "$AVG_PROC_MB" -le 0 ]]; then
@@ -604,20 +607,28 @@ apply_recommended_config() {
         exit 1
     fi
 
-    echo "Configtest PASSED. Reloading Apache..."
-    if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files | grep -q httpd; then
-        systemctl reload httpd || systemctl restart httpd
-        log_message "INFO" "Reloaded Apache via systemctl after applying Smart Tuner configuration"
-    elif command -v service >/dev/null 2>&1; then
-        service httpd reload || service httpd restart
-        log_message "INFO" "Reloaded Apache via service after applying Smart Tuner configuration"
+    if [[ "${APACHE_RUNNING:-0}" -ne 1 ]]; then
+        echo "Configtest PASSED. Apache appears stopped; skipping reload."
+        echo "Start Apache manually to apply new settings, e.g. systemctl start httpd"
+        echo "Apache Smart Tuner: configuration written; awaiting manual Apache start."
+        log_message "WARN" "Config applied but Apache not running; skipped reload"
+        log_message "INFO" "Applied Smart Tuner configuration to $TARGET_FILE with tier $TIER and MPM $MPM_TYPE"
     else
-        apachectl graceful || apachectl restart
-        log_message "INFO" "Reloaded Apache via apachectl after applying Smart Tuner configuration"
-    fi
+        echo "Configtest PASSED. Reloading Apache..."
+        if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files | grep -q httpd; then
+            systemctl reload httpd || systemctl restart httpd
+            log_message "INFO" "Reloaded Apache via systemctl after applying Smart Tuner configuration"
+        elif command -v service >/dev/null 2>&1; then
+            service httpd reload || service httpd restart
+            log_message "INFO" "Reloaded Apache via service after applying Smart Tuner configuration"
+        else
+            apachectl graceful || apachectl restart
+            log_message "INFO" "Reloaded Apache via apachectl after applying Smart Tuner configuration"
+        fi
 
-    echo "Apache Smart Tuner: configuration successfully applied."
-    log_message "INFO" "Applied Smart Tuner configuration to $TARGET_FILE with tier $TIER and MPM $MPM_TYPE"
+        echo "Apache Smart Tuner: configuration successfully applied."
+        log_message "INFO" "Applied Smart Tuner configuration to $TARGET_FILE with tier $TIER and MPM $MPM_TYPE"
+    fi
 }
 
 # ----------------- locate directives (QUIET) -----------------
@@ -697,6 +708,11 @@ echo "Detected MPM:           $MPM_TYPE"
 echo "Tier:                   $TIER"
 echo "Total RAM:              ${TOTAL_MEM} MB"
 echo "CPU Cores:              ${CORES}"
+if [[ "$APACHE_RUNNING" -eq 1 ]]; then
+    echo "Apache running:         yes (${APACHE_PROCS} processes observed)"
+else
+    echo "Apache running:         no (using default ${MPM_TYPE} memory model)"
+fi
 echo "Apache RAM Budget:      ${APACHE_BUDGET_MB} MB (${APACHE_PCT} of total)"
 echo "Avg httpd proc size:    ${AVG_PROC_MB} MB"
 echo "------------------------------------------------"
