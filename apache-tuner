@@ -482,6 +482,18 @@ json_bool() {
     fi
 }
 
+extract_tuner_block() {
+    local FILE="$1"
+    [[ -f "$FILE" ]] || return
+
+    sed -n '/# BEGIN APACHE_SMART_TUNER/,/# END APACHE_SMART_TUNER/p' "$FILE"
+}
+
+normalize_block_for_compare() {
+    # normalize whitespace/newlines for reliable comparisons
+    printf "%s" "$1" | sed 's/[[:space:]]*$//'
+}
+
 build_json_output() {
     local block_json
     block_json=${RECOMMENDED_BLOCK//$'\n'/\\n}
@@ -740,6 +752,42 @@ build_recommended_block() {
 
 # ----------------- apply config safely -----------------
 
+reload_apache() {
+    if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files >/dev/null 2>&1; then
+        for unit in httpd apache2; do
+            if systemctl list-unit-files | grep -q "^${unit}\.service"; then
+                systemctl reload "$unit" || systemctl restart "$unit"
+                return
+            fi
+        done
+    fi
+
+    if command -v service >/dev/null 2>&1; then
+        for svc in httpd apache2; do
+            if service "$svc" status >/dev/null 2>&1; then
+                service "$svc" reload || service "$svc" restart
+                return
+            fi
+        done
+    fi
+
+    if command -v apachectl >/dev/null 2>&1; then
+        apachectl graceful || apachectl restart
+    elif command -v apache2ctl >/dev/null 2>&1; then
+        apache2ctl graceful || apache2ctl restart
+    fi
+}
+
+config_matches_recommendation() {
+    local FILE="$1"
+    local EXISTING_BLOCK
+
+    EXISTING_BLOCK=$(extract_tuner_block "$FILE")
+    [[ -z "$EXISTING_BLOCK" ]] && return 1
+
+    [[ "$(normalize_block_for_compare "$EXISTING_BLOCK")" == "$(normalize_block_for_compare "$RECOMMENDED_BLOCK")" ]]
+}
+
 apply_recommended_config() {
     if [[ "$EUID" -ne 0 ]]; then
         echo "ERROR: --apply must be run as root."
@@ -770,6 +818,12 @@ apply_recommended_config() {
     fi
 
     [[ ! -f "$TARGET_FILE" ]] && touch "$TARGET_FILE"
+
+    if config_matches_recommendation "$TARGET_FILE"; then
+        echo "Smart Tuner block already matches recommendation in $TARGET_FILE; skipping backup and reload."
+        log_message "INFO" "Skipped apply: $TARGET_FILE already contains current Smart Tuner block"
+        return
+    fi
 
     local TS BACKUP_FILE
     TS=$(date +%Y%m%d%H%M%S)
@@ -842,16 +896,8 @@ apply_recommended_config() {
         log_message "INFO" "Config applied to $TARGET_FILE with reload intentionally skipped"
     else
         echo "Configtest PASSED. Reloading Apache..."
-        if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files | grep -q httpd; then
-            systemctl reload httpd || systemctl restart httpd
-            log_message "INFO" "Reloaded Apache via systemctl after applying Smart Tuner configuration"
-        elif command -v service >/dev/null 2>&1; then
-            service httpd reload || service httpd restart
-            log_message "INFO" "Reloaded Apache via service after applying Smart Tuner configuration"
-        else
-            apachectl graceful || apachectl restart
-            log_message "INFO" "Reloaded Apache via apachectl after applying Smart Tuner configuration"
-        fi
+        reload_apache
+        log_message "INFO" "Reloaded Apache after applying Smart Tuner configuration"
 
         echo "Apache Smart Tuner: configuration successfully applied."
         log_message "INFO" "Applied Smart Tuner configuration to $TARGET_FILE with tier $TIER and MPM $MPM_TYPE"
