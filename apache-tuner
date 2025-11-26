@@ -36,12 +36,14 @@ MODE="analyze"
 
 usage() {
     cat <<EOF
-Usage: $0 [--analyze] [--locate] [--apply] [--version]
+Usage: $0 [--analyze] [--locate] [--apply] [--version] [--json] [--no-reload]
 
-  --analyze   (default) Print recommended Apache MPM config based on current RAM/cores
-  --locate    Show which Apache config files currently define MPM-related directives
-  --apply     Safely write/update recommended config into a cPanel include (or generic conf.d)
-  --version   Display the current Apache Smart Tuner version and exit
+  --analyze     (default) Print recommended Apache MPM config based on current RAM/cores
+  --locate      Show which Apache config files currently define MPM-related directives
+  --apply       Safely write/update recommended config into a cPanel include (or generic conf.d)
+  --json        Emit analyze output as JSON for automation (mutually exclusive with --locate)
+  --no-reload   Skip Apache reload/restart after successful --apply (writes config only)
+  --version     Display the current Apache Smart Tuner version and exit
 
 Notes:
   - --apply must be run as root
@@ -57,13 +59,21 @@ print_version() {
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --analyze)
-            MODE="analyze"
+MODE="analyze"
+OUTPUT_FORMAT="text"
+RELOAD_AFTER_APPLY=1
             ;;
         --locate)
             MODE="locate"
             ;;
         --apply)
             MODE="apply"
+            ;;
+        --json)
+            OUTPUT_FORMAT="json"
+            ;;
+        --no-reload)
+            RELOAD_AFTER_APPLY=0
             ;;
         --version)
             print_version
@@ -174,12 +184,12 @@ detect_cpanel() {
 
 detect_mpm() {
     local VOUT=""
-    if command -v httpd >/dev/null 2>&1; then
-        VOUT=$(httpd -V 2>/dev/null || true)
-    fi
-    if [[ -z "$VOUT" && "$(command -v apachectl || echo)" != "" ]]; then
-        VOUT=$(apachectl -V 2>/dev/null || true)
-    fi
+    for bin in httpd apachectl apache2ctl; do
+        if command -v "$bin" >/dev/null 2>&1; then
+            VOUT=$("$bin" -V 2>/dev/null || true)
+            [[ -n "$VOUT" ]] && break
+        fi
+    done
 
     RAW_MPM=$(echo "$VOUT" | grep -i "Server MPM" | awk '{print $3}')
     MPM_TYPE=${RAW_MPM,,}
@@ -213,6 +223,17 @@ detect_resources() {
         echo "ERROR: Unable to detect RAM or CPU core count."
         exit 1
     fi
+}
+
+detect_configtest_cmd() {
+    for cmd in apachectl apache2ctl httpd; do
+        if command -v "$cmd" >/dev/null 2>&1; then
+            APACHE_CONFIGTEST_CMD="$cmd"
+            return
+        fi
+    done
+
+    APACHE_CONFIGTEST_CMD=""
 }
 
 detect_apache_process_name() {
@@ -295,14 +316,73 @@ measure_apache_procs() {
 }
 
 apache_configtest() {
-    if command -v apachectl >/dev/null 2>&1; then
-        apachectl configtest
-    elif command -v httpd >/dev/null 2>&1; then
-        httpd -t
-    else
-        echo "ERROR: Neither apachectl nor httpd found for configtest."
-        return 1
+    if [[ -z "${APACHE_CONFIGTEST_CMD:-}" ]]; then
+        detect_configtest_cmd
     fi
+
+    case "$APACHE_CONFIGTEST_CMD" in
+        apachectl|apache2ctl)
+            "$APACHE_CONFIGTEST_CMD" configtest
+            ;;
+        httpd)
+            httpd -t
+            ;;
+        *)
+            echo "ERROR: No suitable Apache binary found for configtest."
+            return 1
+            ;;
+    esac
+}
+
+json_bool() {
+    if [[ "$1" -eq 0 ]]; then
+        echo "false"
+    else
+        echo "true"
+    fi
+}
+
+build_json_output() {
+    local block_json
+    block_json=${RECOMMENDED_BLOCK//$'\n'/\\n}
+
+    cat <<EOF
+{
+  "version": "$VERSION",
+  "mode": "$MODE",
+  "mpm": "$MPM_TYPE",
+  "tier": "$TIER",
+  "total_ram_mb": $TOTAL_MEM,
+  "cpu_cores": $CORES,
+  "apache_running": $(json_bool "$APACHE_RUNNING"),
+  "observed_processes": $APACHE_PROCS,
+  "avg_httpd_mb": $AVG_PROC_MB,
+  "apache_budget_mb": $APACHE_BUDGET_MB,
+  "recommended_block": "$block_json",
+  "current": {
+    "ServerLimit": "$(sanitize_value "$CUR_SERVER_LIMIT")",
+    "MaxRequestWorkers": "$(sanitize_value "$CUR_MAX_WORKERS")",
+    "ThreadsPerChild": "$(sanitize_value "$CUR_THREADS_PER_CHILD")",
+    "StartServers": "$(sanitize_value "$CUR_START_SERVERS")",
+    "MinSpareThreads": "$(sanitize_value "$CUR_MIN_SPARE_THREADS")",
+    "MaxSpareThreads": "$(sanitize_value "$CUR_MAX_SPARE_THREADS")",
+    "MinSpareServers": "$(sanitize_value "$CUR_MIN_SPARE_SERVERS")",
+    "MaxSpareServers": "$(sanitize_value "$CUR_MAX_SPARE_SERVERS")",
+    "MaxConnectionsPerChild": "$(sanitize_value "$CUR_MAX_CONN_PER_CHILD")"
+  },
+  "recommended": {
+    "ServerLimit": "$(sanitize_value "$SERVER_LIMIT")",
+    "MaxRequestWorkers": "$(sanitize_value "$MAX_WORKERS")",
+    "ThreadsPerChild": "$(sanitize_value "${THREADS_PER_CHILD:-}")",
+    "StartServers": "$(sanitize_value "$START_SERVERS_ROUNDED")",
+    "MinSpareThreads": "$(sanitize_value "${MIN_SPARE_THREADS:-}")",
+    "MaxSpareThreads": "$(sanitize_value "${MAX_SPARE_THREADS:-}")",
+    "MinSpareServers": "$(sanitize_value "${MIN_SPARE_SERVERS:-}")",
+    "MaxSpareServers": "$(sanitize_value "${MAX_SPARE_SERVERS:-}")",
+    "MaxConnectionsPerChild": "$(sanitize_value "$MAX_CONN_PER_CHILD")"
+  }
+}
+EOF
 }
 
 # ----------------- current config parsing -----------------
@@ -613,6 +693,10 @@ apply_recommended_config() {
         echo "Apache Smart Tuner: configuration written; awaiting manual Apache start."
         log_message "WARN" "Config applied but Apache not running; skipped reload"
         log_message "INFO" "Applied Smart Tuner configuration to $TARGET_FILE with tier $TIER and MPM $MPM_TYPE"
+    elif [[ "$RELOAD_AFTER_APPLY" -eq 0 ]]; then
+        echo "Configtest PASSED. Reload skipped due to --no-reload."
+        echo "Apache Smart Tuner: configuration written; reload manually to activate."
+        log_message "INFO" "Config applied to $TARGET_FILE with reload intentionally skipped"
     else
         echo "Configtest PASSED. Reloading Apache..."
         if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files | grep -q httpd; then
@@ -693,6 +777,12 @@ measure_apache_procs
 detect_apache_layout
 detect_cpanel
 get_current_values_with_precedence
+detect_configtest_cmd
+
+if [[ "$OUTPUT_FORMAT" == "json" && "$MODE" != "analyze" ]]; then
+    echo "ERROR: --json is only supported with --analyze mode."
+    exit 1
+fi
 
 if [[ "$MODE" == "locate" ]]; then
     locate_current_mpm_directives
@@ -701,43 +791,47 @@ fi
 
 build_recommended_block
 
-echo "------------------------------------------------"
-echo " Apache Smart Tuner Analysis"
-echo "------------------------------------------------"
-echo "Detected MPM:           $MPM_TYPE"
-echo "Tier:                   $TIER"
-echo "Total RAM:              ${TOTAL_MEM} MB"
-echo "CPU Cores:              ${CORES}"
-if [[ "$APACHE_RUNNING" -eq 1 ]]; then
-    echo "Apache running:         yes (${APACHE_PROCS} processes observed)"
+if [[ "$OUTPUT_FORMAT" == "json" ]]; then
+    build_json_output
 else
-    echo "Apache running:         no (using default ${MPM_TYPE} memory model)"
-fi
-echo "Apache RAM Budget:      ${APACHE_BUDGET_MB} MB (${APACHE_PCT} of total)"
-echo "Avg httpd proc size:    ${AVG_PROC_MB} MB"
-echo "------------------------------------------------"
-echo "Current vs Proposed (${MPM_TYPE}) (current => proposed):"
+    echo "------------------------------------------------"
+    echo " Apache Smart Tuner Analysis"
+    echo "------------------------------------------------"
+    echo "Detected MPM:           $MPM_TYPE"
+    echo "Tier:                   $TIER"
+    echo "Total RAM:              ${TOTAL_MEM} MB"
+    echo "CPU Cores:              ${CORES}"
+    if [[ "$APACHE_RUNNING" -eq 1 ]]; then
+        echo "Apache running:         yes (${APACHE_PROCS} processes observed)"
+    else
+        echo "Apache running:         no (using default ${MPM_TYPE} memory model)"
+    fi
+    echo "Apache RAM Budget:      ${APACHE_BUDGET_MB} MB (${APACHE_PCT} of total)"
+    echo "Avg httpd proc size:    ${AVG_PROC_MB} MB"
+    echo "------------------------------------------------"
+    echo "Current vs Proposed (${MPM_TYPE}) (current => proposed):"
 
-if [[ "$MPM_TYPE" == "prefork" ]]; then
-    print_current_vs_proposed "ServerLimit" "$CUR_SERVER_LIMIT" "$SERVER_LIMIT"
-    print_current_vs_proposed "MaxRequestWorkers" "$CUR_MAX_WORKERS" "$MAX_WORKERS"
-    print_current_vs_proposed "StartServers" "$CUR_START_SERVERS" "$START_SERVERS_ROUNDED"
-    print_current_vs_proposed "MinSpareServers" "$CUR_MIN_SPARE_SERVERS" "$MIN_SPARE_SERVERS"
-    print_current_vs_proposed "MaxSpareServers" "$CUR_MAX_SPARE_SERVERS" "$MAX_SPARE_SERVERS"
-    print_current_vs_proposed "MaxConnectionsPerChild" "$CUR_MAX_CONN_PER_CHILD" "$MAX_CONN_PER_CHILD"
-else
-    print_current_vs_proposed "ServerLimit" "$CUR_SERVER_LIMIT" "$MAX_PROCS"
-    print_current_vs_proposed "MaxRequestWorkers" "$CUR_MAX_WORKERS" "$MAX_WORKERS"
-    print_current_vs_proposed "ThreadsPerChild" "$CUR_THREADS_PER_CHILD" "$THREADS_PER_CHILD"
-    print_current_vs_proposed "StartServers" "$CUR_START_SERVERS" "$START_SERVERS_ROUNDED"
-    print_current_vs_proposed "MinSpareThreads" "$CUR_MIN_SPARE_THREADS" "$MIN_SPARE_THREADS"
-    print_current_vs_proposed "MaxSpareThreads" "$CUR_MAX_SPARE_THREADS" "$MAX_SPARE_THREADS"
-    print_current_vs_proposed "MaxConnectionsPerChild" "$CUR_MAX_CONN_PER_CHILD" "$MAX_CONN_PER_CHILD"
-fi
+    if [[ "$MPM_TYPE" == "prefork" ]]; then
+        print_current_vs_proposed "ServerLimit" "$CUR_SERVER_LIMIT" "$SERVER_LIMIT"
+        print_current_vs_proposed "MaxRequestWorkers" "$CUR_MAX_WORKERS" "$MAX_WORKERS"
+        print_current_vs_proposed "StartServers" "$CUR_START_SERVERS" "$START_SERVERS_ROUNDED"
+        print_current_vs_proposed "MinSpareServers" "$CUR_MIN_SPARE_SERVERS" "$MIN_SPARE_SERVERS"
+        print_current_vs_proposed "MaxSpareServers" "$CUR_MAX_SPARE_SERVERS" "$MAX_SPARE_SERVERS"
+        print_current_vs_proposed "MaxConnectionsPerChild" "$CUR_MAX_CONN_PER_CHILD" "$MAX_CONN_PER_CHILD"
+    else
+        print_current_vs_proposed "ServerLimit" "$CUR_SERVER_LIMIT" "$MAX_PROCS"
+        print_current_vs_proposed "MaxRequestWorkers" "$CUR_MAX_WORKERS" "$MAX_WORKERS"
+        print_current_vs_proposed "ThreadsPerChild" "$CUR_THREADS_PER_CHILD" "$THREADS_PER_CHILD"
+        print_current_vs_proposed "StartServers" "$CUR_START_SERVERS" "$START_SERVERS_ROUNDED"
+        print_current_vs_proposed "MinSpareThreads" "$CUR_MIN_SPARE_THREADS" "$MIN_SPARE_THREADS"
+        print_current_vs_proposed "MaxSpareThreads" "$CUR_MAX_SPARE_THREADS" "$MAX_SPARE_THREADS"
+        print_current_vs_proposed "MaxConnectionsPerChild" "$CUR_MAX_CONN_PER_CHILD" "$MAX_CONN_PER_CHILD"
+    fi
 
-echo "------------------------------------------------"
-echo -e "$RECOMMENDED_BLOCK"
-echo "------------------------------------------------"
+    echo "------------------------------------------------"
+    echo -e "$RECOMMENDED_BLOCK"
+    echo "------------------------------------------------"
+fi
 
 if [[ "$MODE" == "apply" ]]; then
     apply_recommended_config
