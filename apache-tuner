@@ -1,6 +1,6 @@
 #!/bin/bash
 # ==============================================================================
-# Apache Smart Tuner v1.16.1 for cPanel / WHM & generic Apache
+# Apache Smart Tuner v1.17.0 for cPanel / WHM & generic Apache
 # Author: Ryan MacDonald <ryan@rfxn.com>
 # License: GPL-3.0-or-later
 #
@@ -25,12 +25,14 @@
 set -u   # keep "undefined var" safety; avoid -e/pipefail to prevent silent exits
 
 VERSION_MAJOR=1
-VERSION_MINOR=16
-VERSION_PATCH=1
+VERSION_MINOR=17
+VERSION_PATCH=0
 VERSION="${VERSION_MAJOR}.${VERSION_MINOR}.${VERSION_PATCH}"
 VERSION_NAME="Apache Smart Tuner v${VERSION}"
 
 LOG_FILE="/var/log/apache-smart-tuner.log"
+BUDGET_OVERRIDE=""
+BUDGET_SOURCE="tier"
 
 MODE="analyze"
 MODE_SET=0
@@ -52,15 +54,18 @@ set_mode() {
 
 usage() {
     cat <<EOF
-Usage: $0 [--analyze] [--locate] [--apply] [--version] [--json] [--no-reload] [--mpm <type>]
+Usage: $0 [--analyze] [--locate] [--apply] [--version] [--json] [--no-reload] [--mpm <type>] [--budget <0.x>] [--log-file <path|none>]
 
-  --analyze     (default) Print recommended Apache MPM config based on current RAM/cores
-  --locate      Show which Apache config files currently define MPM-related directives
-  --apply       Safely write/update recommended config into a cPanel include (or generic conf.d)
-  --json        Emit analyze output as JSON for automation (mutually exclusive with --locate)
-  --no-reload   Skip Apache reload/restart after successful --apply (writes config only)
-  --mpm <type>  Force MPM assumption (prefork|worker|event) when binary probing is unavailable
-  --version     Display the current Apache Smart Tuner version and exit
+  --analyze           (default) Print recommended Apache MPM config based on current RAM/cores
+  --locate            Show which Apache config files currently define MPM-related directives
+  --apply             Safely write/update recommended config into a cPanel include (or generic conf.d)
+  --json              Emit analyze output as JSON for automation (mutually exclusive with --locate)
+  --no-reload         Skip Apache reload/restart after successful --apply (writes config only)
+  --mpm <type>        Force MPM assumption (prefork|worker|event) when binary probing is unavailable
+  --budget <0.x>      Override tier-based Apache RAM budget percentage (0.05-0.95)
+  --log-file <path>   Write logs to the given file (default: /var/log/apache-smart-tuner.log)
+                      Use "none" to disable filesystem logging
+  --version           Display the current Apache Smart Tuner version and exit
 
 Notes:
   - --apply must be run as root
@@ -108,6 +113,30 @@ while [[ $# -gt 0 ]]; do
                     ;;
             esac
             ;;
+        --budget)
+            if [[ -z "${2:-}" ]]; then
+                echo "ERROR: --budget requires a percentage in decimal form (e.g., 0.40)"
+                exit 1
+            fi
+            if ! validate_budget_pct "$2"; then
+                echo "ERROR: --budget must be between 0.05 and 0.95 (e.g., 0.35)"
+                exit 1
+            fi
+            BUDGET_OVERRIDE="$2"
+            shift
+            ;;
+        --log-file)
+            if [[ -z "${2:-}" ]]; then
+                echo "ERROR: --log-file requires a path or 'none'"
+                exit 1
+            fi
+            if [[ "$2" == "none" ]]; then
+                LOG_FILE=""
+            else
+                LOG_FILE="$2"
+            fi
+            shift
+            ;;
         --version)
             print_version
             exit 0
@@ -149,6 +178,16 @@ log_message() {
     if [[ -n "$LOG_FILE" ]]; then
         echo "$FORMATTED" >> "$LOG_FILE" 2>/dev/null || true
     fi
+}
+
+validate_budget_pct() {
+    local PCT="$1"
+
+    if [[ ! "$PCT" =~ ^0\.[0-9]+$ ]]; then
+        return 1
+    fi
+
+    awk "BEGIN { exit !($PCT >= 0.05 && $PCT <= 0.95) }"
 }
 
 round_down_to_multiple_of_8() {
@@ -370,6 +409,13 @@ set_tier_params() {
         MRW_CAP_PREFORK=1600
         MRW_CAP_THREADED=12000
     fi
+
+    if [[ -n "$BUDGET_OVERRIDE" ]]; then
+        APACHE_PCT="$BUDGET_OVERRIDE"
+        BUDGET_SOURCE="override"
+    else
+        BUDGET_SOURCE="tier"
+    fi
 }
 
 measure_apache_procs() {
@@ -435,6 +481,9 @@ build_json_output() {
   "observed_processes": $APACHE_PROCS,
   "avg_httpd_mb": $AVG_PROC_MB,
   "apache_budget_mb": $APACHE_BUDGET_MB,
+  "apache_budget_pct": $APACHE_PCT,
+  "apache_budget_source": "$BUDGET_SOURCE",
+  "log_file": "$(sanitize_value "${LOG_FILE:-}")",
   "recommended_block": "$block_json",
   "current": {
     "ServerLimit": "$(sanitize_value "$CUR_SERVER_LIMIT")",
@@ -883,7 +932,7 @@ else
     else
         echo "Apache running:         no (using default ${MPM_TYPE} memory model)"
     fi
-    echo "Apache RAM Budget:      ${APACHE_BUDGET_MB} MB (${APACHE_PCT} of total)"
+    echo "Apache RAM Budget:      ${APACHE_BUDGET_MB} MB (${APACHE_PCT} of total; source: ${BUDGET_SOURCE})"
     echo "Avg httpd proc size:    ${AVG_PROC_MB} MB"
     echo "------------------------------------------------"
     echo "Current vs Proposed (${MPM_TYPE}) (current => proposed):"
