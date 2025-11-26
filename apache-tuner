@@ -1,6 +1,6 @@
 #!/bin/bash
 # ==============================================================================
-# Apache Smart Tuner v1.18.0 for cPanel / WHM & generic Apache
+# Apache Smart Tuner v1.19.0 for cPanel / WHM & generic Apache
 # Author: Ryan MacDonald <ryan@rfxn.com>
 # License: GPL-3.0-or-later
 #
@@ -31,7 +31,7 @@
 set -u   # keep "undefined var" safety; avoid -e/pipefail to prevent silent exits
 
 VERSION_MAJOR=1
-VERSION_MINOR=18
+VERSION_MINOR=19
 VERSION_PATCH=0
 VERSION="${VERSION_MAJOR}.${VERSION_MINOR}.${VERSION_PATCH}"
 VERSION_NAME="Apache Smart Tuner v${VERSION}"
@@ -45,6 +45,8 @@ MODE_SET=0
 OUTPUT_FORMAT="text"
 RELOAD_AFTER_APPLY=1
 MPM_OVERRIDE=""
+EXPORT_PATH=""
+MPM_SOURCE="unknown"
 
 set_mode() {
     local NEW_MODE="$1"
@@ -60,12 +62,13 @@ set_mode() {
 
 usage() {
     cat <<EOF
-Usage: $0 [--analyze] [--locate] [--apply] [--version] [--json] [--no-reload] [--mpm <type>] [--budget <0.x>] [--log-file <path|none>]
+Usage: $0 [--analyze] [--locate] [--apply] [--version] [--json] [--export <path>] [--no-reload] [--mpm <type>] [--budget <0.x>] [--log-file <path|none>]
 
   --analyze           (default) Print recommended Apache MPM config based on current RAM/cores
   --locate            Show which Apache config files currently define MPM-related directives
   --apply             Safely write/update recommended config into a cPanel include (or generic conf.d)
   --json              Emit analyze output as JSON for automation (mutually exclusive with --locate)
+  --export <path>     Write ONLY the recommended Smart Tuner block to <path> (no config edits/reloads)
   --no-reload         Skip Apache reload/restart after successful --apply (writes config only)
   --mpm <type>        Force MPM assumption (prefork|worker|event) when binary probing is unavailable
   --budget <0.x>      Override tier-based Apache RAM budget percentage (0.05-0.95)
@@ -118,6 +121,14 @@ while [[ $# -gt 0 ]]; do
                     exit 1
                     ;;
             esac
+            ;;
+        --export)
+            if [[ -z "${2:-}" ]]; then
+                echo "ERROR: --export requires a file path argument"
+                exit 1
+            fi
+            EXPORT_PATH="$2"
+            shift
             ;;
         --budget)
             if [[ -z "${2:-}" ]]; then
@@ -261,7 +272,11 @@ detect_cpanel() {
 }
 
 detect_mpm() {
-    [[ -n "$MPM_OVERRIDE" ]] && { MPM_TYPE="$MPM_OVERRIDE"; return; }
+    if [[ -n "$MPM_OVERRIDE" ]]; then
+        MPM_TYPE="$MPM_OVERRIDE"
+        MPM_SOURCE="override"
+        return
+    fi
 
     local VOUT=""
     for bin in httpd apachectl apache2ctl; do
@@ -273,10 +288,31 @@ detect_mpm() {
 
     RAW_MPM=$(echo "$VOUT" | grep -i "Server MPM" | awk '{print $3}')
     MPM_TYPE=${RAW_MPM,,}
+    [[ -n "$MPM_TYPE" ]] && MPM_SOURCE="binary -V"
 
-    if [[ -z "$MPM_TYPE" || "$MPM_TYPE" == "" ]]; then
+    if [[ -z "$MPM_TYPE" ]]; then
+        local MOUT=""
+        for bin in httpd apachectl apache2ctl; do
+            if command -v "$bin" >/dev/null 2>&1; then
+                MOUT=$("$bin" -M 2>/dev/null || true)
+                [[ -n "$MOUT" ]] && break
+            fi
+        done
+
+        if [[ -n "$MOUT" ]]; then
+            RAW_MPM=$(echo "$MOUT" | awk '/mpm_(prefork|worker|event)_module/ {print $1; exit}')
+            if [[ -n "$RAW_MPM" ]]; then
+                MPM_TYPE=$(echo "$RAW_MPM" | sed -E 's/.*mpm_([a-z]+)_module/\1/i')
+                MPM_TYPE=${MPM_TYPE,,}
+                MPM_SOURCE="module-list"
+            fi
+        fi
+    fi
+
+    if [[ -z "$MPM_TYPE" ]]; then
         detect_apache_layout
         MPM_TYPE=$(infer_mpm_from_config)
+        [[ -n "$MPM_TYPE" ]] && MPM_SOURCE="config"
     fi
 
     if [[ -z "$MPM_TYPE" ]]; then
@@ -503,6 +539,7 @@ build_json_output() {
   "version": "$VERSION",
   "mode": "$MODE",
   "mpm": "$MPM_TYPE",
+  "mpm_source": "$MPM_SOURCE",
   "tier": "$TIER",
   "total_ram_mb": $TOTAL_MEM,
   "cpu_cores": $CORES,
@@ -513,6 +550,7 @@ build_json_output() {
   "apache_budget_pct": $APACHE_PCT,
   "apache_budget_source": "$BUDGET_SOURCE",
   "log_file": "$(sanitize_value "${LOG_FILE:-}")",
+  "export_path": "$(sanitize_value "${EXPORT_PATH:-}")",
   "recommended_block": "$block_json",
   "current": {
     "ServerLimit": "$(sanitize_value "$CUR_SERVER_LIMIT")",
@@ -538,6 +576,30 @@ build_json_output() {
   }
 }
 EOF
+}
+
+export_recommended_block() {
+    local DEST="$1"
+
+    if [[ -z "$DEST" ]]; then
+        echo "ERROR: --export requires a valid file path"
+        exit 1
+    fi
+
+    local DEST_DIR
+    DEST_DIR=$(dirname "$DEST")
+    if [[ ! -d "$DEST_DIR" ]]; then
+        echo "ERROR: Export directory does not exist: $DEST_DIR"
+        exit 1
+    fi
+
+    printf "%b" "$RECOMMENDED_BLOCK" > "$DEST"
+
+    if [[ "$OUTPUT_FORMAT" != "json" ]]; then
+        echo "Smart Tuner block exported to: $DEST"
+    fi
+
+    log_message "INFO" "Exported Smart Tuner block to $DEST"
 }
 
 # ----------------- current config parsing -----------------
@@ -973,6 +1035,11 @@ if [[ "$OUTPUT_FORMAT" == "json" && "$MODE" != "analyze" ]]; then
     exit 1
 fi
 
+if [[ "$MODE" == "locate" && -n "$EXPORT_PATH" ]]; then
+    echo "ERROR: --export cannot be combined with --locate mode."
+    exit 1
+fi
+
 if [[ "$MODE" == "locate" ]]; then
     locate_current_mpm_directives
     exit 0
@@ -980,13 +1047,17 @@ fi
 
 build_recommended_block
 
+if [[ -n "$EXPORT_PATH" ]]; then
+    export_recommended_block "$EXPORT_PATH"
+fi
+
 if [[ "$OUTPUT_FORMAT" == "json" ]]; then
     build_json_output
 else
     echo "------------------------------------------------"
     echo " Apache Smart Tuner Analysis"
     echo "------------------------------------------------"
-    echo "Detected MPM:           $MPM_TYPE"
+    echo "Detected MPM:           $MPM_TYPE (source: $MPM_SOURCE)"
     echo "Tier:                   $TIER"
     echo "Total RAM:              ${TOTAL_MEM} MB"
     echo "CPU Cores:              ${CORES}"
