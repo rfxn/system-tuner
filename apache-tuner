@@ -47,6 +47,7 @@ RELOAD_AFTER_APPLY=1
 MPM_OVERRIDE=""
 EXPORT_PATH=""
 MPM_SOURCE="unknown"
+APACHE_BINARIES=()
 
 set_mode() {
     local NEW_MODE="$1"
@@ -181,6 +182,16 @@ need_cmd() {
     fi
 }
 
+discover_apache_binaries() {
+    APACHE_BINARIES=()
+
+    for bin in apachectl apache2ctl httpd; do
+        if command -v "$bin" >/dev/null 2>&1; then
+            APACHE_BINARIES+=("$bin")
+        fi
+    done
+}
+
 log_message() {
     local LEVEL="$1"
     local MESSAGE="$2"
@@ -291,11 +302,11 @@ detect_mpm() {
     fi
 
     local VOUT=""
-    for bin in httpd apachectl apache2ctl; do
-        if command -v "$bin" >/dev/null 2>&1; then
-            VOUT=$("$bin" -V 2>/dev/null || true)
-            [[ -n "$VOUT" ]] && break
-        fi
+    [[ ${#APACHE_BINARIES[@]} -eq 0 ]] && discover_apache_binaries
+
+    for bin in "${APACHE_BINARIES[@]}"; do
+        VOUT=$("$bin" -V 2>/dev/null || true)
+        [[ -n "$VOUT" ]] && break
     done
 
     RAW_MPM=$(echo "$VOUT" | grep -i "Server MPM" | awk '{print $3}')
@@ -304,11 +315,9 @@ detect_mpm() {
 
     if [[ -z "$MPM_TYPE" ]]; then
         local MOUT=""
-        for bin in httpd apachectl apache2ctl; do
-            if command -v "$bin" >/dev/null 2>&1; then
-                MOUT=$("$bin" -M 2>/dev/null || true)
-                [[ -n "$MOUT" ]] && break
-            fi
+        for bin in "${APACHE_BINARIES[@]}"; do
+            MOUT=$("$bin" -M 2>/dev/null || true)
+            [[ -n "$MOUT" ]] && break
         done
 
         if [[ -n "$MOUT" ]]; then
@@ -359,14 +368,23 @@ detect_resources() {
 }
 
 detect_configtest_cmd() {
-    for cmd in apachectl apache2ctl httpd; do
-        if command -v "$cmd" >/dev/null 2>&1; then
-            APACHE_CONFIGTEST_CMD="$cmd"
-            return
-        fi
+    [[ ${#APACHE_BINARIES[@]} -eq 0 ]] && discover_apache_binaries
+
+    local FALLBACK_HTTPD=""
+
+    for cmd in "${APACHE_BINARIES[@]}"; do
+        case "$cmd" in
+            apachectl|apache2ctl)
+                APACHE_CONFIGTEST_CMD="$cmd"
+                return
+                ;;
+            httpd)
+                FALLBACK_HTTPD="$cmd"
+                ;;
+        esac
     done
 
-    APACHE_CONFIGTEST_CMD=""
+    APACHE_CONFIGTEST_CMD="$FALLBACK_HTTPD"
 }
 
 detect_apache_process_name() {
@@ -699,11 +717,16 @@ get_current_values_with_precedence() {
 
     # 2) Runtime (DUMP_RUN_CFG) fills blanks
     local CURRENT_DUMP=""
-    if command -v apachectl >/dev/null 2>&1; then
-        CURRENT_DUMP=$(apachectl -t -D DUMP_RUN_CFG 2>/dev/null || true)
-    elif command -v httpd >/dev/null 2>&1; then
-        CURRENT_DUMP=$(httpd -t -D DUMP_RUN_CFG 2>/dev/null || true)
-    fi
+    [[ ${#APACHE_BINARIES[@]} -eq 0 ]] && discover_apache_binaries
+
+    for bin in "${APACHE_BINARIES[@]}"; do
+        case "$bin" in
+            apachectl|apache2ctl|httpd)
+                CURRENT_DUMP=$("$bin" -t -D DUMP_RUN_CFG 2>/dev/null || true)
+                [[ -n "$CURRENT_DUMP" ]] && break
+                ;;
+        esac
+    done
 
     if [[ -n "$CURRENT_DUMP" ]] && echo "$CURRENT_DUMP" | grep -q "ServerLimit:" 2>/dev/null; then
         [[ -z "$CUR_SERVER_LIMIT" || "$CUR_SERVER_LIMIT" == "unknown" ]] \
