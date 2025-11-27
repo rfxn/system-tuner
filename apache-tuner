@@ -1,6 +1,6 @@
 #!/bin/bash
 # ==============================================================================
-# Apache Smart Tuner v1.19.0 for cPanel / WHM & generic Apache
+# Apache Smart Tuner v1.19.1 for cPanel / WHM & generic Apache
 # Author: Ryan MacDonald <ryan@rfxn.com>
 # License: GPL-3.0-or-later
 #
@@ -32,7 +32,7 @@ set -u   # keep "undefined var" safety; avoid -e/pipefail to prevent silent exit
 
 VERSION_MAJOR=1
 VERSION_MINOR=19
-VERSION_PATCH=0
+VERSION_PATCH=1
 VERSION="${VERSION_MAJOR}.${VERSION_MINOR}.${VERSION_PATCH}"
 VERSION_NAME="Apache Smart Tuner v${VERSION}"
 
@@ -194,6 +194,18 @@ log_message() {
 
     if [[ -n "$LOG_FILE" ]]; then
         echo "$FORMATTED" >> "$LOG_FILE" 2>/dev/null || true
+    fi
+}
+
+preflight_validate_options() {
+    if [[ "$OUTPUT_FORMAT" == "json" && "$MODE" != "analyze" ]]; then
+        echo "ERROR: --json is only supported with --analyze mode."
+        exit 1
+    fi
+
+    if [[ "$MODE" == "locate" && -n "$EXPORT_PATH" ]]; then
+        echo "ERROR: --export cannot be combined with --locate mode."
+        exit 1
     fi
 }
 
@@ -528,6 +540,18 @@ extract_tuner_block() {
 normalize_block_for_compare() {
     # normalize whitespace/newlines for reliable comparisons
     printf "%s" "$1" | sed 's/[[:space:]]*$//'
+}
+
+run_analysis_pipeline() {
+    detect_apache_layout
+    detect_cpanel
+    detect_mpm
+    detect_resources
+    set_tier_params
+    measure_apache_procs
+    get_current_values_with_precedence
+    detect_configtest_cmd
+    build_recommended_block
 }
 
 build_json_output() {
@@ -1021,31 +1045,14 @@ print_current_vs_proposed() {
 
 # ----------------- main -----------------
 
-detect_apache_layout
-detect_cpanel
-detect_mpm
-detect_resources
-set_tier_params
-measure_apache_procs
-get_current_values_with_precedence
-detect_configtest_cmd
-
-if [[ "$OUTPUT_FORMAT" == "json" && "$MODE" != "analyze" ]]; then
-    echo "ERROR: --json is only supported with --analyze mode."
-    exit 1
-fi
-
-if [[ "$MODE" == "locate" && -n "$EXPORT_PATH" ]]; then
-    echo "ERROR: --export cannot be combined with --locate mode."
-    exit 1
-fi
+preflight_validate_options
 
 if [[ "$MODE" == "locate" ]]; then
     locate_current_mpm_directives
     exit 0
 fi
 
-build_recommended_block
+run_analysis_pipeline
 
 if [[ -n "$EXPORT_PATH" ]]; then
     export_recommended_block "$EXPORT_PATH"
