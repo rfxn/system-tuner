@@ -181,6 +181,14 @@ need_cmd() {
     fi
 }
 
+verify_prerequisites() {
+    local REQUIRED_CMDS=(awk bc cp date dirname free grep head mkdir mktemp nproc ps sed sort wc)
+
+    for cmd in "${REQUIRED_CMDS[@]}"; do
+        need_cmd "$cmd"
+    done
+}
+
 log_message() {
     local LEVEL="$1"
     local MESSAGE="$2"
@@ -195,6 +203,18 @@ log_message() {
     if [[ -n "$LOG_FILE" ]]; then
         echo "$FORMATTED" >> "$LOG_FILE" 2>/dev/null || true
     fi
+}
+
+prepare_log_destination() {
+    if [[ -z "$LOG_FILE" ]]; then
+        return
+    fi
+
+    local LOG_DIR
+    LOG_DIR=$(dirname "$LOG_FILE")
+
+    mkdir -p "$LOG_DIR" 2>/dev/null || true
+    touch "$LOG_FILE" 2>/dev/null || true
 }
 
 validate_budget_pct() {
@@ -469,6 +489,16 @@ set_tier_params() {
     else
         BUDGET_SOURCE="tier"
     fi
+}
+
+safe_mktemp() {
+    local TMPFILE
+    TMPFILE=$(mktemp 2>/dev/null) || {
+        echo "ERROR: Unable to create a temporary file for config rewrite."
+        exit 1
+    }
+
+    echo "$TMPFILE"
 }
 
 measure_apache_procs() {
@@ -850,6 +880,21 @@ config_matches_recommendation() {
     [[ "$(normalize_block_for_compare "$EXISTING_BLOCK")" == "$(normalize_block_for_compare "$RECOMMENDED_BLOCK")" ]]
 }
 
+determine_target_file() {
+    if [[ "$IS_CPANEL" -eq 1 && -d "$INCLUDES_DIR" ]]; then
+        if [[ -n "${PREFORK_INCLUDE:-}" && -f "$PREFORK_INCLUDE" ]]; then
+            echo "$PREFORK_INCLUDE"
+            return
+        fi
+
+        echo "${INCLUDES_DIR}/pre_main_global.conf"
+        return
+    fi
+
+    mkdir -p "$INCLUDES_DIR"
+    echo "${INCLUDES_DIR}/apache-smart-tuner.conf"
+}
+
 apply_recommended_config() {
     if [[ "$EUID" -ne 0 ]]; then
         echo "ERROR: --apply must be run as root."
@@ -859,7 +904,7 @@ apply_recommended_config() {
     detect_apache_layout
     detect_cpanel
 
-    touch "$LOG_FILE" 2>/dev/null || true
+    prepare_log_destination
 
     echo "Running preflight Apache configtest..."
     if ! apache_configtest; then
@@ -868,16 +913,7 @@ apply_recommended_config() {
         exit 1
     fi
 
-    if [[ "$IS_CPANEL" -eq 1 && -d "$INCLUDES_DIR" ]]; then
-        if [[ -n "${PREFORK_INCLUDE:-}" && -f "$PREFORK_INCLUDE" ]]; then
-            TARGET_FILE="$PREFORK_INCLUDE"
-        else
-            TARGET_FILE="${INCLUDES_DIR}/pre_main_global.conf"
-        fi
-    else
-        mkdir -p "$INCLUDES_DIR"
-        TARGET_FILE="${INCLUDES_DIR}/apache-smart-tuner.conf"
-    fi
+    TARGET_FILE=$(determine_target_file)
 
     [[ ! -f "$TARGET_FILE" ]] && touch "$TARGET_FILE"
 
@@ -895,7 +931,7 @@ apply_recommended_config() {
     log_message "INFO" "Backup created at $BACKUP_FILE for target $TARGET_FILE"
 
     local tmpfile
-    tmpfile=$(mktemp)
+    tmpfile=$(safe_mktemp)
     awk '
         BEGIN {
             in_tuner = 0;
@@ -1020,6 +1056,8 @@ print_current_vs_proposed() {
 }
 
 # ----------------- main -----------------
+
+verify_prerequisites
 
 detect_apache_layout
 detect_cpanel
