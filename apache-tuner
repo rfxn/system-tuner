@@ -833,6 +833,7 @@ build_recommended_block() {
         MAX_PROCS=$(round_down_to_multiple_of_8 "$MAX_PROCS")
         (( MAX_PROCS < 1 )) && MAX_PROCS=1
         MAX_WORKERS=$(( MAX_PROCS * THREADS_PER_CHILD ))
+        SERVER_LIMIT="$MAX_PROCS"
 
         MIN_SPARE_THREADS=$(( MIN_SPARE * THREADS_PER_CHILD ))
         MAX_SPARE_THREADS=$(( MAX_SPARE * THREADS_PER_CHILD ))
