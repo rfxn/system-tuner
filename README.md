@@ -7,6 +7,7 @@ Apache Smart Tuner is a Bash-based capacity planner for Apache HTTP Server that 
 - **Tiered profiles:** LOW, LOW-MID, MID, MID-HIGH, and HIGH profiles automatically cap ServerLimit/MaxRequestWorkers (or threads) for a wide range of footprints.
 - **Cautious floors and caps:** Enforces sensible minimums (128 workers/threads) while honoring tier ceilings (128/256/1024/2048/4096 by tier) to avoid runaway prefork deployments.
 - **Clear visibility:** Prints current versus proposed settings, emits an annotated config block, and now supports machine-readable JSON output for automation.
+- **Log health scan:** Reviews recent Apache error logs for worker saturation, ServerLimit warnings, common crash/timeout patterns, and restart frequency with checklist-style output.
 - **Safe application path:** Creates timestamped backups, scrubs legacy MPM blocks, validates with `configtest`, and reloads (or optionally skips reload) only after a clean validation.
 - **cPanel/WHM integration:** Prefers `pre_virtualhost_global.conf` when present, falls back to `pre_main_global.conf`, and triggers `/scripts/rebuildhttpdconf` when applying changes.
 - **Operator control:** Override the RAM budget percentage when you need a custom envelope and redirect or disable on-disk logging per run.
@@ -59,7 +60,7 @@ sudo ./apache-tuner --apply --no-reload
 ```
 
 ## What to expect
-Text analysis output includes environment detection, current vs proposed values, and the ready-to-paste block:
+Text analysis output includes environment detection, an error log & stability review, current vs proposed values, and the ready-to-paste block:
 
 ```
 ------------------------------------------------
@@ -72,6 +73,16 @@ CPU Cores:              4
 Apache running:         yes (180 processes observed)
 Apache RAM Budget:      2867 MB (0.35 of total; source: tier)
 Avg httpd proc size:    10 MB
+------------------------------------------------
+ Error log & stability review
+------------------------------------------------
+  [--] Log source          /var/log/apache2/error.log (last 5000 lines)
+  [OK] Worker saturation   No MaxRequestWorkers saturation observed
+  [OK] ServerLimit warnings No ServerLimit notices detected
+  [OK] Process crashes/segfaults No Process crashes/segfaults observed in sampled lines.
+  [--] Slow CGI/PHP timeouts 3 entries related to Slow CGI/PHP timeouts.
+  [OK] Client denials      No Client denials observed in sampled lines.
+  [--] Apache restarts     1 restart events; max 1/day across 1 day(s).
 ------------------------------------------------
 Current vs Proposed (prefork) (current => proposed):
   ServerLimit           256          => 256
@@ -118,6 +129,22 @@ JSON output mirrors the same data structure for pipelines:
   "apache_budget_source": "tier",
   "log_file": "/var/log/apache-smart-tuner.log",
   "recommended_block": "# BEGIN APACHE_SMART_TUNER\n# Apache Smart Tuner v1.19.1 (Tier: LOW-MID, MPM: prefork)\nTimeout 120\nKeepAlive On\nMaxKeepAliveRequests 100\nKeepAliveTimeout 5\n\n<IfModule prefork.c>\n    ServerLimit            256\n    MaxRequestWorkers      256\n    StartServers           2\n    MinSpareServers        2\n    MaxSpareServers        8\n    MaxConnectionsPerChild 4000\n</IfModule>\n# END APACHE_SMART_TUNER\n",
+  "log_review": {
+    "status": "ready",
+    "message": "Analyzed last 5000 lines",
+    "error_log_path": "/var/log/apache2/error.log",
+    "sampled_lines": 5000,
+    "scoreboard_hits": 0,
+    "server_limit_hits": 0,
+    "restarts_total": 1,
+    "restart_days_observed": 1,
+    "restart_max_per_day": 1,
+    "common_errors": {
+      "segfaults": 0,
+      "timeouts": 3,
+      "denied": 0
+    }
+  },
   "current": {
     "ServerLimit": "256",
     "MaxRequestWorkers": "256",
