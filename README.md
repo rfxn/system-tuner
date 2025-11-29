@@ -7,7 +7,7 @@ Apache Smart Tuner is a Bash-based capacity planner for Apache HTTP Server that 
 - **Tiered profiles:** LOW, LOW-MID, MID, MID-HIGH, and HIGH profiles automatically cap ServerLimit/MaxRequestWorkers (or threads) for a wide range of footprints.
 - **Cautious floors and caps:** Enforces sensible minimums (128 workers/threads) while honoring tier ceilings (128/256/1024/2048/4096 by tier) to avoid runaway prefork deployments.
 - **Clear visibility:** Prints current versus proposed settings, emits an annotated config block, and now supports machine-readable JSON output for automation.
-- **Log health scan:** Reviews recent Apache error logs for worker saturation, ServerLimit warnings, common crash/timeout patterns, and restart frequency with checklist-style output.
+- **Log health scan:** Reviews the last 24 hours of Apache error logs (or the entire file if newer) for worker saturation, ServerLimit warnings, common crash/timeout patterns, and restart frequency with checklist-style output.
 - **Safe application path:** Creates timestamped backups, scrubs legacy MPM blocks, validates with `configtest`, and reloads (or optionally skips reload) only after a clean validation.
 - **cPanel/WHM integration:** Prefers `pre_virtualhost_global.conf` when present, falls back to `pre_main_global.conf`, and triggers `/scripts/rebuildhttpdconf` when applying changes.
 - **Operator control:** Override the RAM budget percentage when you need a custom envelope and redirect or disable on-disk logging per run.
@@ -76,7 +76,7 @@ Avg httpd proc size:    10 MB
 ------------------------------------------------
  Error log & stability review
 ------------------------------------------------
-  [--] Log source          /var/log/apache2/error.log (last 5000 lines)
+  [--] Log source          /var/log/apache2/error.log (last 24 hours)
   [OK] Worker saturation   No MaxRequestWorkers saturation observed
   [OK] ServerLimit warnings No ServerLimit notices detected
   [OK] Process crashes/segfaults No Process crashes/segfaults observed in sampled lines.
@@ -131,9 +131,9 @@ JSON output mirrors the same data structure for pipelines:
   "recommended_block": "# BEGIN APACHE_SMART_TUNER\n# Apache Smart Tuner v1.19.1 (Tier: LOW-MID, MPM: prefork)\nTimeout 120\nKeepAlive On\nMaxKeepAliveRequests 100\nKeepAliveTimeout 5\n\n<IfModule prefork.c>\n    ServerLimit            256\n    MaxRequestWorkers      256\n    StartServers           2\n    MinSpareServers        2\n    MaxSpareServers        8\n    MaxConnectionsPerChild 4000\n</IfModule>\n# END APACHE_SMART_TUNER\n",
   "log_review": {
     "status": "ready",
-    "message": "Analyzed last 5000 lines",
+    "message": "Analyzed last 15000 lines",
     "error_log_path": "/var/log/apache2/error.log",
-    "sampled_lines": 5000,
+    "sampled_lines": 15000,
     "scoreboard_hits": 0,
     "server_limit_hits": 0,
     "restarts_total": 1,
