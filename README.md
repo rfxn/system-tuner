@@ -7,6 +7,7 @@ Apache Smart Tuner is a Bash-based capacity planner for Apache HTTP Server that 
 - **Tiered profiles:** LOW, LOW-MID, MID, MID-HIGH, and HIGH profiles automatically cap ServerLimit/MaxRequestWorkers (or threads) for a wide range of footprints.
 - **Cautious floors and caps:** Enforces sensible minimums (128 workers/threads) while honoring tier ceilings (128/256/1024/2048/4096 by tier) to avoid runaway prefork deployments.
 - **Clear visibility:** Prints current versus proposed settings, emits an annotated config block, and now supports machine-readable JSON output for automation.
+- **Runtime signals:** Reviews recent Apache error logs for scoreboard saturation, MaxRequestWorkers/ServerLimit pressure, crashes, and restart frequency to surface operational risks.
 - **Safe application path:** Creates timestamped backups, scrubs legacy MPM blocks, validates with `configtest`, and reloads (or optionally skips reload) only after a clean validation.
 - **cPanel/WHM integration:** Prefers `pre_virtualhost_global.conf` when present, falls back to `pre_main_global.conf`, and triggers `/scripts/rebuildhttpdconf` when applying changes.
 - **Operator control:** Override the RAM budget percentage when you need a custom envelope and redirect or disable on-disk logging per run.
@@ -80,6 +81,14 @@ Current vs Proposed (prefork) (current => proposed):
   MinSpareServers       5            => 2
   MaxSpareServers       10           => 8
   MaxConnectionsPerChild 0           => 4000
+------------------------------------------------
+ Runtime health (last 24h):
+ [OK] Scoreboard saturation         No scoreboard full events seen
+ [OK] MaxRequestWorkers pressure    No capacity notices logged
+ [OK] Restarts                      1 restart/resume events recorded
+ [OK] Crash signals                 No crash signatures detected
+ Top recurring error lines:
+   - 1x [Wed Dec 13 00:00:00.000000 2023] [mpm_prefork:notice] [pid 1234] AH00163: Apache/2.4.57 (Unix) configured -- resuming normal operations
 ------------------------------------------------
 # BEGIN APACHE_SMART_TUNER
 # Apache Smart Tuner v1.19.1 (Tier: LOW-MID, MPM: prefork)

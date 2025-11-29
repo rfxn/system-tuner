@@ -40,6 +40,16 @@ LOG_FILE="/var/log/apache-smart-tuner.log"
 BUDGET_OVERRIDE=""
 BUDGET_SOURCE="tier"
 
+LOG_ANALYSIS_WINDOW_HOURS=24
+ERROR_LOGS=()
+LOG_ANALYSIS_AVAILABLE=0
+RECENT_LOG_CACHE=""
+SCOREBOARD_FULL_HITS=0
+MAXWORKERS_SATURATION=0
+RESTART_EVENT_COUNT=0
+CRASH_EVENT_COUNT=0
+TOP_ERROR_SUMMARY=()
+
 MODE="analyze"
 MODE_SET=0
 OUTPUT_FORMAT="text"
@@ -548,6 +558,31 @@ json_bool() {
     fi
 }
 
+json_escape() {
+    local val="$1"
+    val=${val//\\/\\\\}
+    val=${val//"/\\"}
+    val=${val//$'\n'/ }
+    echo "$val"
+}
+
+json_array_from_list() {
+    local items=()
+    local escaped=""
+
+    if [[ "$#" -gt 0 ]]; then
+        items=("$@")
+        for item in "${items[@]}"; do
+            local safe
+            safe=$(json_escape "$item")
+            escaped+="\"$safe\"," 
+        done
+    fi
+
+    escaped=${escaped%,}
+    echo "$escaped"
+}
+
 extract_tuner_block() {
     local FILE="$1"
     [[ -f "$FILE" ]] || return
@@ -558,6 +593,110 @@ extract_tuner_block() {
 normalize_block_for_compare() {
     # normalize whitespace/newlines for reliable comparisons
     printf "%s" "$1" | sed 's/[[:space:]]*$//'
+}
+
+# ----------------- error log analysis -----------------
+
+discover_error_logs() {
+    ERROR_LOGS=()
+
+    detect_apache_layout
+
+    local CANDIDATES=(
+        "/usr/local/apache/logs/error_log"
+        "/var/log/apache2/error.log"
+        "/var/log/httpd/error_log"
+        "/etc/httpd/logs/error_log"
+        "/var/log/apache/error.log"
+    )
+
+    for log in "${CANDIDATES[@]}"; do
+        [[ -f "$log" ]] && ERROR_LOGS+=("$log")
+    done
+
+    if [[ ${#ERROR_LOGS[@]} -eq 0 && -f "${HTTPD_CONF:-}" ]]; then
+        mapfile -t CONF_LOGS < <(grep -E '^[[:space:]]*ErrorLog' "$HTTPD_CONF" 2>/dev/null | awk '{print $2}' | sed 's/\"//g')
+        for log in "${CONF_LOGS[@]:-}"; do
+            [[ -f "$log" ]] && ERROR_LOGS+=("$log")
+        done
+    fi
+}
+
+filter_log_window() {
+    local FILE="$1"
+    local CUTOFF="$2"
+
+    awk -v cutoff="$CUTOFF" '
+        function month_num(m) {
+            return index("JanFebMarAprMayJunJulAugSepOctNovDec", m) / 3
+        }
+        match($0, /\[([A-Za-z]{3}) ([ 0-9][0-9]) ([0-9]{2}):([0-9]{2}):([0-9]{2})(\.[0-9]+)? ([0-9]{4})\]/, ts) {
+            mon = month_num(ts[1]);
+            day = ts[2];
+            hh = ts[3];
+            mm = ts[4];
+            ss = ts[5];
+            yr = ts[7];
+            epoch = mktime(sprintf("%d %d %d %d %d %d", yr, mon, day, hh, mm, ss));
+            if (epoch >= cutoff) {
+                print $0;
+            }
+        }
+    ' "$FILE" 2>/dev/null
+}
+
+analyze_error_logs() {
+    LOG_ANALYSIS_AVAILABLE=0
+    RECENT_LOG_CACHE=""
+    SCOREBOARD_FULL_HITS=0
+    MAXWORKERS_SATURATION=0
+    RESTART_EVENT_COUNT=0
+    CRASH_EVENT_COUNT=0
+    TOP_ERROR_SUMMARY=()
+
+    discover_error_logs
+    (( ${#ERROR_LOGS[@]} == 0 )) && return
+
+    local cutoff
+    cutoff=$(date -d "now - ${LOG_ANALYSIS_WINDOW_HOURS} hours" +%s 2>/dev/null || date -v -"${LOG_ANALYSIS_WINDOW_HOURS}"H +%s 2>/dev/null || echo "")
+    [[ -z "$cutoff" ]] && return
+
+    local tmpfile
+    tmpfile=$(mktemp)
+
+    for log in "${ERROR_LOGS[@]}"; do
+        filter_log_window "$log" "$cutoff" >> "$tmpfile"
+    done
+
+    if [[ ! -s "$tmpfile" ]]; then
+        rm -f "$tmpfile"
+        return
+    fi
+
+    LOG_ANALYSIS_AVAILABLE=1
+    RECENT_LOG_CACHE="$tmpfile"
+
+    SCOREBOARD_FULL_HITS=$(grep -iE "scoreboard is full" "$tmpfile" 2>/dev/null | wc -l | awk '{print $1}')
+    MAXWORKERS_SATURATION=$(grep -iE "server reached Max(RequestWorkers|Clients)" "$tmpfile" 2>/dev/null | wc -l | awk '{print $1}')
+    RESTART_EVENT_COUNT=$(grep -iE "resuming normal operations|caught SIGTERM|graceful restart|SIGHUP" "$tmpfile" 2>/dev/null | wc -l | awk '{print $1}')
+    CRASH_EVENT_COUNT=$(grep -iE "segmentation fault|seg fault|child pid [0-9]+ exit signal|stack trace" "$tmpfile" 2>/dev/null | wc -l | awk '{print $1}')
+
+    mapfile -t TOP_ERROR_SUMMARY < <(
+        awk '
+            BEGIN { FS="] " }
+            {
+                line=$0
+                sub(/^\[[^]]+\] /, "", line)
+                gsub(/[[:space:]]+/, " ", line)
+                counts[line]++
+            }
+            END {
+                for (msg in counts) {
+                    printf "%d|%s\n", counts[msg], msg;
+                }
+            }
+        ' "$tmpfile" | sort -nr | head -3
+    )
 }
 
 run_analysis_pipeline() {
@@ -575,6 +714,19 @@ run_analysis_pipeline() {
 build_json_output() {
     local block_json
     block_json=${RECOMMENDED_BLOCK//$'\n'/\\n}
+
+    local log_list top_errors_json
+    log_list=$(json_array_from_list "${ERROR_LOGS[@]:-}")
+
+    local top_errors=()
+    for entry in "${TOP_ERROR_SUMMARY[@]:-}"; do
+        local count msg
+        count=${entry%%|*}
+        msg=${entry#*|}
+        top_errors+=("${count} occurrences: ${msg}")
+    done
+
+    top_errors_json=$(json_array_from_list "${top_errors[@]:-}")
 
     cat <<EOF
 {
@@ -615,6 +767,16 @@ build_json_output() {
     "MinSpareServers": "$(sanitize_value "${MIN_SPARE_SERVERS:-}")",
     "MaxSpareServers": "$(sanitize_value "${MAX_SPARE_SERVERS:-}")",
     "MaxConnectionsPerChild": "$(sanitize_value "$MAX_CONN_PER_CHILD")"
+  },
+  "log_analysis": {
+    "available": $(json_bool "$LOG_ANALYSIS_AVAILABLE"),
+    "window_hours": $LOG_ANALYSIS_WINDOW_HOURS,
+    "error_logs": [${log_list}],
+    "scoreboard_full": $SCOREBOARD_FULL_HITS,
+    "maxrequestworkers_saturation": $MAXWORKERS_SATURATION,
+    "restarts": $RESTART_EVENT_COUNT,
+    "crashes": $CRASH_EVENT_COUNT,
+    "top_errors": [${top_errors_json}]
   }
 }
 EOF
@@ -1056,6 +1218,21 @@ sanitize_value() {
     echo "$val"
 }
 
+format_health_line() {
+    local status="$1"
+    local label="$2"
+    local detail="$3"
+
+    local marker="[--]"
+    case "$status" in
+        ok) marker="[OK]" ;;
+        warn) marker="[!!]" ;;
+        info) marker="[--]" ;;
+    esac
+
+    printf " %s %-30s %s\n" "$marker" "$label" "$detail"
+}
+
 print_current_vs_proposed() {
     local label
     local current
@@ -1077,6 +1254,11 @@ if [[ "$MODE" == "locate" ]]; then
 fi
 
 run_analysis_pipeline
+
+analyze_error_logs
+if [[ -n "$RECENT_LOG_CACHE" ]]; then
+    trap '[[ -n "$RECENT_LOG_CACHE" && -f "$RECENT_LOG_CACHE" ]] && rm -f "$RECENT_LOG_CACHE"' EXIT
+fi
 
 if [[ -n "$EXPORT_PATH" ]]; then
     export_recommended_block "$EXPORT_PATH"
@@ -1117,6 +1299,46 @@ else
         print_current_vs_proposed "MinSpareThreads" "$CUR_MIN_SPARE_THREADS" "$MIN_SPARE_THREADS"
         print_current_vs_proposed "MaxSpareThreads" "$CUR_MAX_SPARE_THREADS" "$MAX_SPARE_THREADS"
         print_current_vs_proposed "MaxConnectionsPerChild" "$CUR_MAX_CONN_PER_CHILD" "$MAX_CONN_PER_CHILD"
+    fi
+
+    echo "------------------------------------------------"
+
+    echo " Runtime health (last ${LOG_ANALYSIS_WINDOW_HOURS}h):"
+    if [[ "$LOG_ANALYSIS_AVAILABLE" -eq 1 ]]; then
+        if (( SCOREBOARD_FULL_HITS > 0 )); then
+            format_health_line "warn" "Scoreboard saturation" "${SCOREBOARD_FULL_HITS} log hits; reduce KeepAlive costs or raise MaxRequestWorkers carefully"
+        else
+            format_health_line "ok" "Scoreboard saturation" "No scoreboard full events seen"
+        fi
+
+        if (( MAXWORKERS_SATURATION > 0 )); then
+            format_health_line "warn" "MaxRequestWorkers pressure" "${MAXWORKERS_SATURATION} notices about ServerLimit/MaxRequestWorkers reached"
+        else
+            format_health_line "ok" "MaxRequestWorkers pressure" "No capacity notices logged"
+        fi
+
+        if (( RESTART_EVENT_COUNT > 3 )); then
+            format_health_line "warn" "Restarts" "${RESTART_EVENT_COUNT} restarts in window; review stability and reload cadence"
+        else
+            format_health_line "ok" "Restarts" "${RESTART_EVENT_COUNT} restart/resume events recorded"
+        fi
+
+        if (( CRASH_EVENT_COUNT > 0 )); then
+            format_health_line "warn" "Crash signals" "${CRASH_EVENT_COUNT} crash/segfault notices in error logs"
+        else
+            format_health_line "ok" "Crash signals" "No crash signatures detected"
+        fi
+
+        if [[ ${#TOP_ERROR_SUMMARY[@]} -gt 0 ]]; then
+            echo " Top recurring error lines:"
+            for entry in "${TOP_ERROR_SUMMARY[@]}"; do
+                count=${entry%%|*}
+                msg=${entry#*|}
+                echo "   - ${count}x ${msg}"
+            done
+        fi
+    else
+        format_health_line "info" "Error log scan" "No readable Apache error logs found; runtime signals unavailable"
     fi
 
     echo "------------------------------------------------"
