@@ -39,6 +39,10 @@ VERSION_NAME="Apache Smart Tuner v${VERSION}"
 LOG_FILE="/var/log/apache-smart-tuner.log"
 BUDGET_OVERRIDE=""
 BUDGET_SOURCE="tier"
+ERROR_LOG_LOOKBACK_HOURS=24
+
+SPINNER_PID=""
+SPINNER_MESSAGE=""
 
 MODE="analyze"
 MODE_SET=0
@@ -236,6 +240,39 @@ log_message() {
 
     if [[ -n "$LOG_FILE" ]]; then
         echo "$FORMATTED" >> "$LOG_FILE" 2>/dev/null || true
+    fi
+}
+
+start_progress_indicator() {
+    [[ "$OUTPUT_FORMAT" == "json" ]] && return
+    [[ -t 1 ]] || return
+
+    local MESSAGE="$1"
+    SPINNER_MESSAGE="$MESSAGE"
+    local FRAMES=('|' '/' '-' '\\')
+    local i=0
+
+    (
+        while true; do
+            printf "\r%s %s" "$SPINNER_MESSAGE" "${FRAMES[$((i % 4))]}"
+            sleep 0.2
+            ((i++))
+        done
+    ) &
+
+    SPINNER_PID=$!
+}
+
+stop_progress_indicator() {
+    [[ "$OUTPUT_FORMAT" == "json" ]] && return
+    [[ -t 1 ]] || return
+
+    if [[ -n "${SPINNER_PID:-}" ]]; then
+        kill "$SPINNER_PID" >/dev/null 2>&1 || true
+        wait "$SPINNER_PID" 2>/dev/null || true
+        SPINNER_PID=""
+        printf "\r%s ... done\n" "$SPINNER_MESSAGE"
+        SPINNER_MESSAGE=""
     fi
 }
 
@@ -495,12 +532,52 @@ load_error_log_sample() {
         return
     fi
 
-    LOG_SAMPLE_CONTENT=$(tail -n 5000 "$APACHE_ERROR_LOG" 2>/dev/null || true)
+    local cutoff_epoch
+    cutoff_epoch=$(date -d "${ERROR_LOG_LOOKBACK_HOURS} hours ago" +%s 2>/dev/null || true)
+    if [[ -z "$cutoff_epoch" ]]; then
+        cutoff_epoch=$(python - <<'PY'
+import time
+import sys
+from datetime import datetime, timedelta
+
+cutoff = datetime.now() - timedelta(hours=int(sys.argv[1]))
+print(int(cutoff.timestamp()))
+PY
+        "$ERROR_LOG_LOOKBACK_HOURS")
+    fi
+
+    LOG_SAMPLE_CONTENT=$(perl -MTime::Piece -e '
+        use strict;
+        use warnings;
+
+        my ($path, $cutoff) = @ARGV;
+        my $keep = 0;
+        my @collected;
+
+        open my $fh, "<", $path or exit 0;
+
+        while (my $line = <$fh>) {
+            if ($line =~ /\[[A-Za-z]{3}\s+([A-Za-z]{3})\s+(\d{1,2})\s+([0-9:]{8})(?:\.[0-9]+)?\s+(\d{4})\]/) {
+                my ($mon, $mday, $time, $year) = ($1, $2, $3, $4);
+                my $epoch = eval { Time::Piece->strptime("$year $mon $mday $time", "%Y %b %d %T")->epoch };
+                if ($@) {
+                    $keep = 1;
+                } else {
+                    $keep = $epoch >= $cutoff ? 1 : 0;
+                }
+            }
+
+            push @collected, $line if $keep;
+        }
+
+        print @collected;
+    ' "$APACHE_ERROR_LOG" "$cutoff_epoch" 2>/dev/null || true)
+
     ERROR_LOG_SAMPLE_LINES=$(wc -l <<< "$LOG_SAMPLE_CONTENT")
 
     if [[ "$ERROR_LOG_SAMPLE_LINES" -eq 0 ]]; then
         LOG_REVIEW_STATUS="empty"
-        LOG_REVIEW_MESSAGE="Apache error log is empty ($APACHE_ERROR_LOG)"
+        LOG_REVIEW_MESSAGE="Apache error log is empty in the last ${ERROR_LOG_LOOKBACK_HOURS} hours ($APACHE_ERROR_LOG)"
     fi
 }
 
@@ -574,7 +651,7 @@ analyze_error_log() {
     fi
 
     LOG_REVIEW_STATUS="ready"
-    LOG_REVIEW_MESSAGE="Analyzed last ${ERROR_LOG_SAMPLE_LINES} lines"
+    LOG_REVIEW_MESSAGE="Analyzed the last ${ERROR_LOG_LOOKBACK_HOURS} hours (${ERROR_LOG_SAMPLE_LINES} lines)"
 
     SCOREBOARD_HITS=$(count_log_pattern "scoreboard is full|server reached MaxRequestWorkers setting|server reached MaxRequestWorkers|MaxRequestWorkers setting, consider raising the MaxRequestWorkers setting")
     SERVER_LIMIT_HITS=$(count_log_pattern "ServerLimit")
@@ -1338,7 +1415,9 @@ if [[ "$MODE" == "locate" ]]; then
     exit 0
 fi
 
+start_progress_indicator "Collecting Apache metrics and log data"
 run_analysis_pipeline
+stop_progress_indicator
 
 if [[ -n "$EXPORT_PATH" ]]; then
     export_recommended_block "$EXPORT_PATH"
