@@ -49,6 +49,37 @@ EXPORT_PATH=""
 MPM_SOURCE="unknown"
 APACHE_BINARIES=()
 
+# Error log review defaults
+APACHE_ERROR_LOG=""
+ERROR_LOG_SAMPLE_LINES=0
+LOG_REVIEW_STATUS="not_run"
+LOG_REVIEW_MESSAGE=""
+SCOREBOARD_HITS=0
+SERVER_LIMIT_HITS=0
+RESTART_TOTAL=0
+RESTART_DAY_COUNT=0
+RESTART_MAX_PER_DAY=0
+LOG_SAMPLE_CONTENT=""
+
+# Common error patterns to highlight during log review
+declare -A COMMON_ERROR_PATTERNS=(
+    [segfaults]="segfault|segmentation fault|child process .*dumped core"
+    [timeouts]="script timed out|mod_fcgid: read data timeout|mod_fcgid: can't apply process slot"
+    [denied]="client denied by server configuration|AH01630|access to .* denied"
+)
+
+# Friendly labels for log review output
+declare -A COMMON_ERROR_LABELS=(
+    [segfaults]="Process crashes/segfaults"
+    [timeouts]="Slow CGI/PHP timeouts"
+    [denied]="Client denials"
+)
+
+LOG_REVIEW_KEYS=(segfaults timeouts denied)
+
+# Initialize per-run counts
+declare -A COMMON_ERROR_COUNTS=()
+
 set_mode() {
     local NEW_MODE="$1"
 
@@ -357,6 +388,7 @@ detect_resources() {
     need_cmd awk
     need_cmd grep
     need_cmd sed
+    need_cmd tail
 
     TOTAL_MEM=$(free -m | awk '/^Mem:/{print $2}')
     CORES=$(nproc)
@@ -396,6 +428,162 @@ detect_apache_process_name() {
     done
 
     APACHE_PROC_NAME="httpd"
+}
+
+reset_log_review() {
+    APACHE_ERROR_LOG=""
+    ERROR_LOG_SAMPLE_LINES=0
+    LOG_REVIEW_STATUS="not_run"
+    LOG_REVIEW_MESSAGE=""
+    LOG_SAMPLE_CONTENT=""
+    SCOREBOARD_HITS=0
+    SERVER_LIMIT_HITS=0
+    RESTART_TOTAL=0
+    RESTART_DAY_COUNT=0
+    RESTART_MAX_PER_DAY=0
+
+    for key in "${!COMMON_ERROR_PATTERNS[@]}"; do
+        COMMON_ERROR_COUNTS[$key]=0
+    done
+}
+
+extract_error_log_from_config() {
+    [[ -z "$HTTPD_CONF" || ! -f "$HTTPD_CONF" ]] && return
+
+    local raw=""
+    raw=$(awk '/^[[:space:]]*ErrorLog[[:space:]]+/ {print $2; exit}' "$HTTPD_CONF")
+    raw=${raw//\"/}
+
+    [[ -z "$raw" || "$raw" == "|"* ]] && return
+
+    if [[ "$raw" != /* ]]; then
+        echo "${APACHE_ROOT%/}/$raw"
+    else
+        echo "$raw"
+    fi
+}
+
+detect_error_log_path() {
+    local candidates=()
+
+    local cfg_log
+    cfg_log=$(extract_error_log_from_config)
+    [[ -n "$cfg_log" ]] && candidates+=("$cfg_log")
+
+    [[ -n "$APACHE_ROOT" ]] && candidates+=("$APACHE_ROOT/logs/error_log" "$APACHE_ROOT/logs/error.log")
+    candidates+=("/usr/local/apache/logs/error_log" "/etc/httpd/logs/error_log" "/var/log/httpd/error_log" "/var/log/apache2/error.log" "/etc/apache2/logs/error_log")
+
+    for path in "${candidates[@]}"; do
+        if [[ -f "$path" ]]; then
+            APACHE_ERROR_LOG="$path"
+            return
+        fi
+    done
+}
+
+load_error_log_sample() {
+    LOG_SAMPLE_CONTENT=""
+    ERROR_LOG_SAMPLE_LINES=0
+
+    if [[ -z "$APACHE_ERROR_LOG" ]]; then
+        return
+    fi
+
+    if [[ ! -r "$APACHE_ERROR_LOG" ]]; then
+        LOG_REVIEW_STATUS="unreadable"
+        LOG_REVIEW_MESSAGE="Apache error log is not readable ($APACHE_ERROR_LOG)"
+        return
+    fi
+
+    LOG_SAMPLE_CONTENT=$(tail -n 5000 "$APACHE_ERROR_LOG" 2>/dev/null || true)
+    ERROR_LOG_SAMPLE_LINES=$(wc -l <<< "$LOG_SAMPLE_CONTENT")
+
+    if [[ "$ERROR_LOG_SAMPLE_LINES" -eq 0 ]]; then
+        LOG_REVIEW_STATUS="empty"
+        LOG_REVIEW_MESSAGE="Apache error log is empty ($APACHE_ERROR_LOG)"
+    fi
+}
+
+count_log_pattern() {
+    local pattern="$1"
+
+    if [[ -z "$LOG_SAMPLE_CONTENT" ]]; then
+        echo 0
+        return
+    fi
+
+    echo "$LOG_SAMPLE_CONTENT" | grep -Eai "$pattern" | wc -l | awk '{print $1}'
+}
+
+analyze_restarts() {
+    local log_content="$1"
+
+    RESTART_TOTAL=0
+    RESTART_DAY_COUNT=0
+    RESTART_MAX_PER_DAY=0
+
+    local restart_counts
+    restart_counts=$(echo "$log_content" | awk '
+        match($0,/^\[([A-Za-z]{3}) ([A-Za-z]{3}) ([ 0-9]{2}) ([0-9:]{8})(\.[0-9]+)? ([0-9]{4})\]/,a) {
+            if ($0 ~ /(resuming normal operations|Graceful restart|Graceful restart requested|caught SIGTERM|caught SIGUSR1|caught SIGHUP)/) {
+                day=sprintf("%s-%02d-%s", a[2], a[3], a[6]);
+                counts[day]++;
+                total++;
+            }
+        }
+        END {
+            for (d in counts) printf("%s %s\n", counts[d], d);
+            printf("TOTAL %s\n", total);
+        }
+    ')
+
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+
+        if [[ "$line" =~ ^TOTAL[[:space:]]+([0-9]+) ]]; then
+            RESTART_TOTAL="${BASH_REMATCH[1]}"
+            continue
+        fi
+
+        if [[ "$line" =~ ^([0-9]+)[[:space:]]+(.+) ]]; then
+            local count="${BASH_REMATCH[1]}"
+            ((RESTART_DAY_COUNT++))
+            if (( count > RESTART_MAX_PER_DAY )); then
+                RESTART_MAX_PER_DAY=$count
+            fi
+        fi
+    done <<< "$restart_counts"
+}
+
+analyze_error_log() {
+    reset_log_review
+
+    detect_error_log_path
+
+    if [[ -z "$APACHE_ERROR_LOG" ]]; then
+        LOG_REVIEW_STATUS="not_found"
+        LOG_REVIEW_MESSAGE="No readable Apache error log detected."
+        return
+    fi
+
+    load_error_log_sample
+
+    if [[ "$ERROR_LOG_SAMPLE_LINES" -eq 0 ]]; then
+        [[ -z "$LOG_REVIEW_MESSAGE" ]] && LOG_REVIEW_MESSAGE="Apache error log is empty ($APACHE_ERROR_LOG)"
+        return
+    fi
+
+    LOG_REVIEW_STATUS="ready"
+    LOG_REVIEW_MESSAGE="Analyzed last ${ERROR_LOG_SAMPLE_LINES} lines"
+
+    SCOREBOARD_HITS=$(count_log_pattern "scoreboard is full|server reached MaxRequestWorkers setting|server reached MaxRequestWorkers|MaxRequestWorkers setting, consider raising the MaxRequestWorkers setting")
+    SERVER_LIMIT_HITS=$(count_log_pattern "ServerLimit")
+
+    for key in "${!COMMON_ERROR_PATTERNS[@]}"; do
+        COMMON_ERROR_COUNTS[$key]=$(count_log_pattern "${COMMON_ERROR_PATTERNS[$key]}")
+    done
+
+    analyze_restarts "$LOG_SAMPLE_CONTENT"
 }
 
 infer_mpm_from_config() {
@@ -568,6 +756,7 @@ run_analysis_pipeline() {
     set_tier_params
     measure_apache_procs
     get_current_values_with_precedence
+    analyze_error_log
     detect_configtest_cmd
     build_recommended_block
 }
@@ -594,6 +783,22 @@ build_json_output() {
   "log_file": "$(sanitize_value "${LOG_FILE:-}")",
   "export_path": "$(sanitize_value "${EXPORT_PATH:-}")",
   "recommended_block": "$block_json",
+  "log_review": {
+    "status": "$LOG_REVIEW_STATUS",
+    "message": "$(sanitize_value "$LOG_REVIEW_MESSAGE")",
+    "error_log_path": "$(sanitize_value "$APACHE_ERROR_LOG")",
+    "sampled_lines": $ERROR_LOG_SAMPLE_LINES,
+    "scoreboard_hits": $SCOREBOARD_HITS,
+    "server_limit_hits": $SERVER_LIMIT_HITS,
+    "restarts_total": $RESTART_TOTAL,
+    "restart_days_observed": $RESTART_DAY_COUNT,
+    "restart_max_per_day": $RESTART_MAX_PER_DAY,
+    "common_errors": {
+      "segfaults": ${COMMON_ERROR_COUNTS[segfaults]:-0},
+      "timeouts": ${COMMON_ERROR_COUNTS[timeouts]:-0},
+      "denied": ${COMMON_ERROR_COUNTS[denied]:-0}
+    }
+  },
   "current": {
     "ServerLimit": "$(sanitize_value "$CUR_SERVER_LIMIT")",
     "MaxRequestWorkers": "$(sanitize_value "$CUR_MAX_WORKERS")",
@@ -1056,6 +1261,63 @@ sanitize_value() {
     echo "$val"
 }
 
+format_health_line() {
+    local status="$1"
+    local label="$2"
+    local detail="$3"
+
+    printf "  %-4s %-32s %s\n" "$status" "$label" "$detail"
+}
+
+print_log_review() {
+    if [[ "$LOG_REVIEW_STATUS" != "ready" ]]; then
+        format_health_line "[--]" "Log availability" "$LOG_REVIEW_MESSAGE"
+        return
+    fi
+
+    format_health_line "[--]" "Log source" "$APACHE_ERROR_LOG (last ${ERROR_LOG_SAMPLE_LINES} lines)"
+
+    if (( SCOREBOARD_HITS > 0 )); then
+        format_health_line "[!!]" "Worker saturation" "$SCOREBOARD_HITS entries showing MaxRequestWorkers/scoreboard exhaustion"
+    else
+        format_health_line "[OK]" "Worker saturation" "No MaxRequestWorkers saturation observed"
+    fi
+
+    if (( SERVER_LIMIT_HITS > 0 )); then
+        format_health_line "[!!]" "ServerLimit warnings" "$SERVER_LIMIT_HITS ServerLimit/MaxRequestWorkers notices"
+    else
+        format_health_line "[OK]" "ServerLimit warnings" "No ServerLimit notices detected"
+    fi
+
+    for key in "${LOG_REVIEW_KEYS[@]}"; do
+        local label="${COMMON_ERROR_LABELS[$key]}"
+        local count=${COMMON_ERROR_COUNTS[$key]:-0}
+        local status="[OK]"
+        local detail="No $label observed in sampled lines."
+
+        if (( count > 0 )); then
+            status="[--]"
+            detail="$count entries related to $label."
+            [[ "$key" == "segfaults" ]] && status="[!!]"
+        fi
+
+        format_health_line "$status" "$label" "$detail"
+    done
+
+    local restart_status="[OK]"
+    local restart_detail="No restart events in sampled log."
+
+    if (( RESTART_TOTAL > 0 )); then
+        restart_detail="$RESTART_TOTAL restart events; max $RESTART_MAX_PER_DAY/day across $RESTART_DAY_COUNT day(s)."
+        restart_status="[--]"
+        if (( RESTART_MAX_PER_DAY > 3 )); then
+            restart_status="[!!]"
+        fi
+    fi
+
+    format_health_line "$restart_status" "Apache restarts" "$restart_detail"
+}
+
 print_current_vs_proposed() {
     local label
     local current
@@ -1099,6 +1361,10 @@ else
     fi
     echo "Apache RAM Budget:      ${APACHE_BUDGET_MB} MB (${APACHE_PCT} of total; source: ${BUDGET_SOURCE})"
     echo "Avg httpd proc size:    ${AVG_PROC_MB} MB"
+    echo "------------------------------------------------"
+    echo " Error log & stability review"
+    echo "------------------------------------------------"
+    print_log_review
     echo "------------------------------------------------"
     echo "Current vs Proposed (${MPM_TYPE}) (current => proposed):"
 
