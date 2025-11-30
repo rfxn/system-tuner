@@ -84,8 +84,8 @@ Avg httpd proc size:    10 MB
   [OK] Client denials      No Client denials observed in sampled lines.
   [--] Apache restarts     1 restart events; max 1/day across 1 day(s).
 ------------------------------------------------
-Current vs Proposed (prefork) (current => proposed):
-  ServerLimit           256          => 256
+  Current vs Proposed (prefork) (current => proposed):
+    ServerLimit           256          => 272
   MaxRequestWorkers     256          => 256
   StartServers          5            => 2
   MinSpareServers       5            => 2
@@ -100,7 +100,7 @@ MaxKeepAliveRequests 100
 KeepAliveTimeout 5
 
 <IfModule prefork.c>
-    ServerLimit            256
+    ServerLimit            272
     MaxRequestWorkers      256
     StartServers           2
     MinSpareServers        2
@@ -128,7 +128,7 @@ JSON output mirrors the same data structure for pipelines:
   "apache_budget_pct": 0.35,
   "apache_budget_source": "tier",
   "log_file": "/var/log/apache-smart-tuner.log",
-  "recommended_block": "# BEGIN APACHE_SMART_TUNER\n# Apache Smart Tuner v1.19.1 (Tier: LOW-MID, MPM: prefork)\nTimeout 120\nKeepAlive On\nMaxKeepAliveRequests 100\nKeepAliveTimeout 5\n\n<IfModule prefork.c>\n    ServerLimit            256\n    MaxRequestWorkers      256\n    StartServers           2\n    MinSpareServers        2\n    MaxSpareServers        8\n    MaxConnectionsPerChild 4000\n</IfModule>\n# END APACHE_SMART_TUNER\n",
+  "recommended_block": "# BEGIN APACHE_SMART_TUNER\n# Apache Smart Tuner v1.19.1 (Tier: LOW-MID, MPM: prefork)\nTimeout 120\nKeepAlive On\nMaxKeepAliveRequests 100\nKeepAliveTimeout 5\n\n<IfModule prefork.c>\n    ServerLimit            272\n    MaxRequestWorkers      256\n    StartServers           2\n    MinSpareServers        2\n    MaxSpareServers        8\n    MaxConnectionsPerChild 4000\n</IfModule>\n# END APACHE_SMART_TUNER\n",
   "log_review": {
     "status": "ready",
     "message": "Analyzed last 15000 lines",
@@ -157,7 +157,7 @@ JSON output mirrors the same data structure for pipelines:
     "MaxConnectionsPerChild": "0"
   },
   "recommended": {
-    "ServerLimit": "256",
+    "ServerLimit": "272",
     "MaxRequestWorkers": "256",
     "ThreadsPerChild": "",
     "StartServers": "2",
@@ -169,6 +169,9 @@ JSON output mirrors the same data structure for pipelines:
   }
 }
 ```
+
+## ServerLimit buffer and "scoreboard full" protection
+Apache keeps old children alive long enough to finish in-flight requests during graceful restarts or MaxConnectionsPerChild recycling. If ServerLimit is set to the exact active process count, those lingering children can temporarily exhaust the scoreboard and block Apache from spawning the replacements, resulting in brief "Scoreboard is full" errors and dropped requests. Apache Smart Tuner pads ServerLimit by a small buffer (5% with an 8-slot minimum) above the calculated MaxRequestWorkers/process count so new workers can come online while old ones drain, without raising steady-state concurrency.
 
 ## Safety details
 - **Backups:** Target include files are copied with a `.bk-YYYYmmddHHMMSS` suffix before any write.

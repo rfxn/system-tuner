@@ -65,6 +65,10 @@ RESTART_DAY_COUNT=0
 RESTART_MAX_PER_DAY=0
 LOG_SAMPLE_CONTENT=""
 
+# Scoreboard safety defaults
+SERVER_LIMIT_BUFFER_PCT="0.05"
+MIN_SERVER_LIMIT_BUFFER=8
+
 # Common error patterns to highlight during log review
 declare -A COMMON_ERROR_PATTERNS=(
     [segfaults]="segfault|segmentation fault|child process .*dumped core"
@@ -320,6 +324,37 @@ round_down_to_multiple_of_8() {
     else
         echo "$NEW_VALUE"
     fi
+}
+
+round_up_to_multiple_of_8() {
+    local VALUE=$1
+    local MULTIPLE=8
+
+    if [[ -z "$VALUE" || "$VALUE" -le 0 ]]; then
+        echo 0
+        return
+    fi
+
+    local REMAINDER=$(( VALUE % MULTIPLE ))
+    if [[ "$REMAINDER" -eq 0 ]]; then
+        echo "$VALUE"
+    else
+        echo $(( VALUE + MULTIPLE - REMAINDER ))
+    fi
+}
+
+calculate_server_limit_with_buffer() {
+    local BASE_VALUE=$1
+
+    local RAW_BUFFER
+    RAW_BUFFER=$(awk -v target="$BASE_VALUE" -v pct="$SERVER_LIMIT_BUFFER_PCT" 'BEGIN { printf "%.0f", (target * pct) }')
+
+    if [[ "$RAW_BUFFER" -lt "$MIN_SERVER_LIMIT_BUFFER" ]]; then
+        RAW_BUFFER=$MIN_SERVER_LIMIT_BUFFER
+    fi
+
+    local BUFFER=$(round_up_to_multiple_of_8 "$RAW_BUFFER")
+    echo $(( BASE_VALUE + BUFFER ))
 }
 
 # ----------------- Apache layout / env detection -----------------
@@ -1070,7 +1105,7 @@ build_recommended_block() {
         (( MAX_WORKERS > MRW_CAP_PREFORK )) && MAX_WORKERS=$MRW_CAP_PREFORK
         (( MAX_WORKERS < 128 )) && MAX_WORKERS=128
 
-        SERVER_LIMIT=$MAX_WORKERS
+        SERVER_LIMIT=$(calculate_server_limit_with_buffer "$MAX_WORKERS")
         MIN_SPARE_SERVERS=$(round_down_to_multiple_of_8 "$MIN_SPARE")
         MAX_SPARE_SERVERS=$(round_down_to_multiple_of_8 "$MAX_SPARE")
         START_SERVERS_ROUNDED=$(round_down_to_multiple_of_8 "$START_SERVERS")
@@ -1115,7 +1150,7 @@ build_recommended_block() {
         MAX_PROCS=$(round_down_to_multiple_of_8 "$MAX_PROCS")
         (( MAX_PROCS < 1 )) && MAX_PROCS=1
         MAX_WORKERS=$(( MAX_PROCS * THREADS_PER_CHILD ))
-        SERVER_LIMIT="$MAX_PROCS"
+        SERVER_LIMIT=$(calculate_server_limit_with_buffer "$MAX_PROCS")
 
         MIN_SPARE_THREADS=$(( MIN_SPARE * THREADS_PER_CHILD ))
         MAX_SPARE_THREADS=$(( MAX_SPARE * THREADS_PER_CHILD ))
@@ -1129,7 +1164,7 @@ build_recommended_block() {
         (( MIN_SPARE_THREADS > MAX_SPARE_THREADS )) && MIN_SPARE_THREADS=$MAX_SPARE_THREADS
 
         MPM_BLOCK="<IfModule mpm_${MPM_TYPE}_module>\n"
-        MPM_BLOCK+="    ServerLimit            $MAX_PROCS\n"
+        MPM_BLOCK+="    ServerLimit            $SERVER_LIMIT\n"
         MPM_BLOCK+="    StartServers           $START_SERVERS_ROUNDED\n"
         MPM_BLOCK+="    MaxRequestWorkers      $MAX_WORKERS\n"
         MPM_BLOCK+="    ThreadsPerChild        $THREADS_PER_CHILD\n"
