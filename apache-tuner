@@ -1490,7 +1490,7 @@ else
         print_current_vs_proposed "MaxSpareServers" "$CUR_MAX_SPARE_SERVERS" "$MAX_SPARE_SERVERS"
         print_current_vs_proposed "MaxConnectionsPerChild" "$CUR_MAX_CONN_PER_CHILD" "$MAX_CONN_PER_CHILD"
     else
-        print_current_vs_proposed "ServerLimit" "$CUR_SERVER_LIMIT" "$MAX_PROCS"
+        print_current_vs_proposed "ServerLimit" "$CUR_SERVER_LIMIT" "$SERVER_LIMIT"
         print_current_vs_proposed "MaxRequestWorkers" "$CUR_MAX_WORKERS" "$MAX_WORKERS"
         print_current_vs_proposed "ThreadsPerChild" "$CUR_THREADS_PER_CHILD" "$THREADS_PER_CHILD"
         print_current_vs_proposed "StartServers" "$CUR_START_SERVERS" "$START_SERVERS_ROUNDED"
