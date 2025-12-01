@@ -766,7 +766,7 @@ set_tier_params() {
         START_SERVERS=3
         MIN_SPARE=3
         MAX_SPARE=8
-        MAX_CONN_PER_CHILD=8000
+        MAX_CONN_PER_CHILD=6000
         MRW_CAP_PREFORK=1024
         MRW_CAP_THREADED=1024
     elif [[ "$TOTAL_MEM" -le 32768 && "$CORES" -ge 8 ]]; then
@@ -777,7 +777,7 @@ set_tier_params() {
         START_SERVERS=4
         MIN_SPARE=4
         MAX_SPARE=10
-        MAX_CONN_PER_CHILD=9000
+        MAX_CONN_PER_CHILD=8000
         MRW_CAP_PREFORK=2048
         MRW_CAP_THREADED=2048
     else
