@@ -26,10 +26,12 @@ chmod +x apache-tuner
 
 ### Flags
 ```
-./apache-tuner [--analyze] [--locate] [--apply] [--json] [--no-reload] [--version] [--budget <0.x>] [--log-file <path|none>]
+./apache-tuner [--analyze] [--locate] [--apply] [--json] [--export <path>] [--no-reload] [--mpm <type>] [--budget <0.x>] [--log-file <path|none>] [--version]
 ```
 - `--json`: Return analysis as JSON (for monitoring/CM pipelines). Only valid with analyze mode.
+- `--export`: Write only the tuned config block to a file without editing Apache configs.
 - `--no-reload`: When combined with `--apply`, write the config but skip the reload/restart.
+- `--mpm`: Force the assumed MPM type (`prefork`, `worker`, or `event`) when detection is blocked.
 - `--version`: Print the current Apache Smart Tuner release.
 - `--budget`: Override the tier-derived Apache RAM budget with a decimal percentage (e.g., `0.40`).
 - `--log-file`: Send tuner logs to a custom file or `none` to disable filesystem logging.
@@ -45,6 +47,12 @@ Produce JSON suitable for automation or dashboards:
 
 ```bash
 ./apache-tuner --json
+```
+
+Export only the recommended block for review or CM pipelines:
+
+```bash
+./apache-tuner --export /tmp/apache-smart-tuner.conf
 ```
 
 Inspect where existing MPM settings live:
@@ -66,7 +74,7 @@ Text analysis output includes environment detection, an error log & stability re
 ------------------------------------------------
  Apache Smart Tuner Analysis
 ------------------------------------------------
-Detected MPM:           prefork
+Detected MPM:           prefork (source: binary -V)
 Tier:                   LOW-MID
 Total RAM:              8192 MB
 CPU Cores:              4
@@ -76,7 +84,7 @@ Avg httpd proc size:    10 MB
 ------------------------------------------------
  Error log & stability review
 ------------------------------------------------
-  [--] Log source          /var/log/apache2/error.log (last 24 hours)
+  [--] Log source          /var/log/apache2/error.log (last 15000 lines)
   [OK] Worker saturation   No MaxRequestWorkers saturation observed
   [OK] ServerLimit warnings No ServerLimit notices detected
   [OK] Process crashes/segfaults No Process crashes/segfaults observed in sampled lines.
@@ -93,7 +101,7 @@ Avg httpd proc size:    10 MB
   MaxConnectionsPerChild 0           => 4000
 ------------------------------------------------
 # BEGIN APACHE_SMART_TUNER
-# Apache Smart Tuner v1.19.1 (Tier: LOW-MID, MPM: prefork)
+# Apache Smart Tuner v1.20.0 (Tier: LOW-MID, MPM: prefork)
 Timeout 120
 KeepAlive On
 MaxKeepAliveRequests 100
@@ -115,9 +123,10 @@ JSON output mirrors the same data structure for pipelines:
 
 ```json
 {
-  "version": "1.19.1",
+  "version": "1.20.0",
   "mode": "analyze",
   "mpm": "prefork",
+  "mpm_source": "binary -V",
   "tier": "LOW-MID",
   "total_ram_mb": 8192,
   "cpu_cores": 4,
@@ -128,10 +137,11 @@ JSON output mirrors the same data structure for pipelines:
   "apache_budget_pct": 0.35,
   "apache_budget_source": "tier",
   "log_file": "/var/log/apache-smart-tuner.log",
-  "recommended_block": "# BEGIN APACHE_SMART_TUNER\n# Apache Smart Tuner v1.19.1 (Tier: LOW-MID, MPM: prefork)\nTimeout 120\nKeepAlive On\nMaxKeepAliveRequests 100\nKeepAliveTimeout 5\n\n<IfModule prefork.c>\n    ServerLimit            272\n    MaxRequestWorkers      256\n    StartServers           2\n    MinSpareServers        2\n    MaxSpareServers        8\n    MaxConnectionsPerChild 4000\n</IfModule>\n# END APACHE_SMART_TUNER\n",
+  "export_path": "",
+  "recommended_block": "# BEGIN APACHE_SMART_TUNER\n# Apache Smart Tuner v1.20.0 (Tier: LOW-MID, MPM: prefork)\nTimeout 120\nKeepAlive On\nMaxKeepAliveRequests 100\nKeepAliveTimeout 5\n\n<IfModule prefork.c>\n    ServerLimit            272\n    MaxRequestWorkers      256\n    StartServers           2\n    MinSpareServers        2\n    MaxSpareServers        8\n    MaxConnectionsPerChild 4000\n</IfModule>\n# END APACHE_SMART_TUNER\n",
   "log_review": {
     "status": "ready",
-    "message": "Analyzed last 15000 lines",
+    "message": "Analyzed the last 24 hours (15000 lines)",
     "error_log_path": "/var/log/apache2/error.log",
     "sampled_lines": 15000,
     "scoreboard_hits": 0,
@@ -180,7 +190,7 @@ Apache keeps old children alive long enough to finish in-flight requests during 
 - **Reload control:** When Apache is running, the tuner reloads automatically unless `--no-reload` is set; if Apache is stopped, it writes the config and logs the pending start.
 
 ## Versioning
-The project follows semantic versioning. The current release is **1.19.1**.
+The project follows semantic versioning. The current release is **1.20.0**.
 
 ## License
 GPL-3.0-or-later. Authored by **Ryan MacDonald <ryan@rfxn.com>**.

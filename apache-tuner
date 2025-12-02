@@ -1,6 +1,6 @@
 #!/bin/bash
 # ==============================================================================
-# Apache Smart Tuner v1.19.1 for cPanel / WHM & generic Apache
+# Apache Smart Tuner v1.20.0 for cPanel / WHM & generic Apache
 # Author: Ryan MacDonald <ryan@rfxn.com>
 # License: GPL-3.0-or-later
 #
@@ -31,8 +31,8 @@
 set -u   # keep "undefined var" safety; avoid -e/pipefail to prevent silent exits
 
 VERSION_MAJOR=1
-VERSION_MINOR=19
-VERSION_PATCH=1
+VERSION_MINOR=20
+VERSION_PATCH=0
 VERSION="${VERSION_MAJOR}.${VERSION_MINOR}.${VERSION_PATCH}"
 VERSION_NAME="Apache Smart Tuner v${VERSION}"
 
@@ -578,6 +578,7 @@ detect_configtest_cmd() {
     APACHE_CONFIGTEST_CMD="$FALLBACK_HTTPD"
 }
 
+# Pin down which httpd process name to monitor before sampling memory.
 detect_apache_process_name() {
     for candidate in httpd apache2; do
         if ps -C "$candidate" -o pid= >/dev/null 2>&1; then
@@ -589,6 +590,7 @@ detect_apache_process_name() {
     APACHE_PROC_NAME="httpd"
 }
 
+# Gather layout, platform, and MPM facts ahead of analysis or apply actions.
 bootstrap_environment() {
     detect_apache_layout
     detect_cpanel
@@ -950,11 +952,12 @@ extract_tuner_block() {
     sed -n '/# BEGIN APACHE_SMART_TUNER/,/# END APACHE_SMART_TUNER/p' "$FILE"
 }
 
+# Normalize whitespace so block comparisons ignore cosmetic drift.
 normalize_block_for_compare() {
-    # normalize whitespace/newlines for reliable comparisons
     printf "%s" "$1" | sed 's/[[:space:]]*$//'
 }
 
+# Drive the main analysis path that turns runtime inputs into a config block.
 run_analysis_pipeline() {
     set_tier_params
     measure_apache_procs
@@ -1303,6 +1306,7 @@ config_matches_recommendation() {
     [[ "$(normalize_block_for_compare "$EXISTING_BLOCK")" == "$(normalize_block_for_compare "$RECOMMENDED_BLOCK")" ]]
 }
 
+# Decide how to respond after applying the block (rollback, log, or reload).
 handle_post_apply() {
     local configtest_status="$1"
     local backup_file="$2"
@@ -1340,6 +1344,7 @@ handle_post_apply() {
     fi
 }
 
+# Apply the recommended block with backups, cleanup, and optional reloads.
 apply_recommended_config() {
     if [[ "$EUID" -ne 0 ]]; then
         echo "ERROR: --apply must be run as root."
