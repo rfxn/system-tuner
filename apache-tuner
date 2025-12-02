@@ -127,89 +127,166 @@ print_version() {
     echo "$VERSION_NAME"
 }
 
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        --analyze)
-            set_mode "analyze"
-            OUTPUT_FORMAT="text"
-            RELOAD_AFTER_APPLY=1
-            ;;
-        --locate)
-            set_mode "locate"
-            ;;
-        --apply)
-            set_mode "apply"
-            ;;
-        --json)
-            OUTPUT_FORMAT="json"
-            ;;
-        --no-reload)
-            RELOAD_AFTER_APPLY=0
-            ;;
-        --mpm)
-            if [[ -z "${2:-}" ]]; then
-                echo "ERROR: --mpm requires an argument (prefork|worker|event)"
+parse_cli_arguments() {
+    OPTIND=1
+
+    local opt
+    while getopts ":h-:" opt; do
+        case "$opt" in
+            h)
+                usage
+                exit 0
+                ;;
+            -)
+                case "$OPTARG" in
+                    analyze)
+                        set_mode "analyze"
+                        OUTPUT_FORMAT="text"
+                        RELOAD_AFTER_APPLY=1
+                        ;;
+                    locate)
+                        set_mode "locate"
+                        ;;
+                    apply)
+                        set_mode "apply"
+                        ;;
+                    json)
+                        OUTPUT_FORMAT="json"
+                        ;;
+                    no-reload)
+                        RELOAD_AFTER_APPLY=0
+                        ;;
+                    mpm)
+                        local next_mpm="${!OPTIND:-}"
+                        if [[ -z "$next_mpm" || "$next_mpm" == -* ]]; then
+                            echo "ERROR: --mpm requires an argument (prefork|worker|event)"
+                            exit 1
+                        fi
+                        case "$next_mpm" in
+                            prefork|worker|event)
+                                MPM_OVERRIDE="$next_mpm"
+                                ;;
+                            *)
+                                echo "ERROR: Unsupported MPM type for --mpm: $next_mpm"
+                                exit 1
+                                ;;
+                        esac
+                        OPTIND=$((OPTIND + 1))
+                        ;;
+                    mpm=*)
+                        local next_mpm="${OPTARG#*=}"
+                        if [[ -z "$next_mpm" ]]; then
+                            echo "ERROR: --mpm requires an argument (prefork|worker|event)"
+                            exit 1
+                        fi
+                        case "$next_mpm" in
+                            prefork|worker|event)
+                                MPM_OVERRIDE="$next_mpm"
+                                ;;
+                            *)
+                                echo "ERROR: Unsupported MPM type for --mpm: $next_mpm"
+                                exit 1
+                                ;;
+                        esac
+                        ;;
+                    export)
+                        local export_path="${!OPTIND:-}"
+                        if [[ -z "$export_path" || "$export_path" == -* ]]; then
+                            echo "ERROR: --export requires a file path argument"
+                            exit 1
+                        fi
+                        EXPORT_PATH="$export_path"
+                        OPTIND=$((OPTIND + 1))
+                        ;;
+                    export=*)
+                        local export_path="${OPTARG#*=}"
+                        if [[ -z "$export_path" ]]; then
+                            echo "ERROR: --export requires a file path argument"
+                            exit 1
+                        fi
+                        EXPORT_PATH="$export_path"
+                        ;;
+                    budget)
+                        local budget_value="${!OPTIND:-}"
+                        if [[ -z "$budget_value" || "$budget_value" == -* ]]; then
+                            echo "ERROR: --budget requires a percentage in decimal form (e.g., 0.40)"
+                            exit 1
+                        fi
+                        if ! validate_budget_pct "$budget_value"; then
+                            echo "ERROR: --budget must be between 0.05 and 0.95 (e.g., 0.35)"
+                            exit 1
+                        fi
+                        BUDGET_OVERRIDE="$budget_value"
+                        OPTIND=$((OPTIND + 1))
+                        ;;
+                    budget=*)
+                        local budget_value="${OPTARG#*=}"
+                        if [[ -z "$budget_value" ]]; then
+                            echo "ERROR: --budget requires a percentage in decimal form (e.g., 0.40)"
+                            exit 1
+                        fi
+                        if ! validate_budget_pct "$budget_value"; then
+                            echo "ERROR: --budget must be between 0.05 and 0.95 (e.g., 0.35)"
+                            exit 1
+                        fi
+                        BUDGET_OVERRIDE="$budget_value"
+                        ;;
+                    log-file)
+                        local log_path="${!OPTIND:-}"
+                        if [[ -z "$log_path" || "$log_path" == -* ]]; then
+                            echo "ERROR: --log-file requires a path or 'none'"
+                            exit 1
+                        fi
+                        if [[ "$log_path" == "none" ]]; then
+                            LOG_FILE=""
+                        else
+                            LOG_FILE="$log_path"
+                        fi
+                        OPTIND=$((OPTIND + 1))
+                        ;;
+                    log-file=*)
+                        local log_path="${OPTARG#*=}"
+                        if [[ -z "$log_path" ]]; then
+                            echo "ERROR: --log-file requires a path or 'none'"
+                            exit 1
+                        fi
+                        if [[ "$log_path" == "none" ]]; then
+                            LOG_FILE=""
+                        else
+                            LOG_FILE="$log_path"
+                        fi
+                        ;;
+                    version)
+                        print_version
+                        exit 0
+                        ;;
+                    help)
+                        usage
+                        exit 0
+                        ;;
+                    *)
+                        echo "Unknown argument: --${OPTARG%%=*}"
+                        usage
+                        exit 1
+                        ;;
+                esac
+                ;;
+            \?)
+                echo "Unknown argument: -$OPTARG"
+                usage
                 exit 1
-            fi
-            case "$2" in
-                prefork|worker|event)
-                    MPM_OVERRIDE="$2"
-                    shift
-                    ;;
-                *)
-                    echo "ERROR: Unsupported MPM type for --mpm: $2"
-                    exit 1
-                    ;;
-            esac
-            ;;
-        --export)
-            if [[ -z "${2:-}" ]]; then
-                echo "ERROR: --export requires a file path argument"
-                exit 1
-            fi
-            EXPORT_PATH="$2"
-            shift
-            ;;
-        --budget)
-            if [[ -z "${2:-}" ]]; then
-                echo "ERROR: --budget requires a percentage in decimal form (e.g., 0.40)"
-                exit 1
-            fi
-            if ! validate_budget_pct "$2"; then
-                echo "ERROR: --budget must be between 0.05 and 0.95 (e.g., 0.35)"
-                exit 1
-            fi
-            BUDGET_OVERRIDE="$2"
-            shift
-            ;;
-        --log-file)
-            if [[ -z "${2:-}" ]]; then
-                echo "ERROR: --log-file requires a path or 'none'"
-                exit 1
-            fi
-            if [[ "$2" == "none" ]]; then
-                LOG_FILE=""
-            else
-                LOG_FILE="$2"
-            fi
-            shift
-            ;;
-        --version)
-            print_version
-            exit 0
-            ;;
-        -h|--help)
-            usage
-            exit 0
-            ;;
-        *)
-            echo "Unknown argument: $1"
-            usage
-            exit 1
-            ;;
-    esac
-    shift
-done
+                ;;
+        esac
+    done
+
+    shift $((OPTIND - 1))
+
+    if [[ $# -gt 0 ]]; then
+        echo "Unknown argument: $1"
+        usage
+        exit 1
+    fi
+}
 
 # ----------------- helpers -----------------
 
@@ -1460,6 +1537,8 @@ print_current_vs_proposed() {
 }
 
 # ----------------- main -----------------
+
+parse_cli_arguments "$@"
 
 preflight_validate_options
 
