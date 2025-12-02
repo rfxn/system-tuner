@@ -434,7 +434,9 @@ detect_mpm() {
     fi
 
     if [[ -z "$MPM_TYPE" ]]; then
-        detect_apache_layout
+        if [[ -z "${APACHE_ROOT:-}" || -z "${HTTPD_CONF:-}" ]]; then
+            detect_apache_layout
+        fi
         MPM_TYPE=$(infer_mpm_from_config)
         [[ -n "$MPM_TYPE" ]] && MPM_SOURCE="config"
     fi
@@ -471,6 +473,14 @@ detect_resources() {
     fi
 }
 
+detect_apache_running() {
+    detect_apache_process_name
+
+    APACHE_PROCS=$(ps -C "$APACHE_PROC_NAME" -o rss= 2>/dev/null | wc -l || echo 0)
+    APACHE_RUNNING=0
+    [[ "$APACHE_PROCS" -gt 0 ]] && APACHE_RUNNING=1
+}
+
 detect_configtest_cmd() {
     [[ ${#APACHE_BINARIES[@]} -eq 0 ]] && discover_apache_binaries
 
@@ -500,6 +510,14 @@ detect_apache_process_name() {
     done
 
     APACHE_PROC_NAME="httpd"
+}
+
+bootstrap_environment() {
+    detect_apache_layout
+    detect_cpanel
+    detect_mpm
+    detect_resources
+    detect_apache_running
 }
 
 reset_log_review() {
@@ -861,10 +879,6 @@ normalize_block_for_compare() {
 }
 
 run_analysis_pipeline() {
-    detect_apache_layout
-    detect_cpanel
-    detect_mpm
-    detect_resources
     set_tier_params
     measure_apache_procs
     get_current_values_with_precedence
@@ -1023,9 +1037,6 @@ get_current_values_with_precedence() {
     CUR_MIN_SPARE_SERVERS=""
     CUR_MAX_SPARE_SERVERS=""
     CUR_MAX_CONN_PER_CHILD=""
-
-    detect_apache_layout
-    detect_cpanel
 
     # 1) cPanel include wins
     if [[ "$IS_CPANEL" -eq 1 && -n "${PREFORK_INCLUDE:-}" && -f "$PREFORK_INCLUDE" ]]; then
@@ -1221,9 +1232,6 @@ apply_recommended_config() {
         exit 1
     fi
 
-    detect_apache_layout
-    detect_cpanel
-
     touch "$LOG_FILE" 2>/dev/null || true
 
     echo "Running preflight Apache configtest..."
@@ -1334,8 +1342,6 @@ apply_recommended_config() {
 # ----------------- locate directives (QUIET) -----------------
 
 locate_current_mpm_directives() {
-    detect_apache_layout
-
     local SEARCH_DIRS=()
     [[ -d "$APACHE_ROOT/conf" ]]   && SEARCH_DIRS+=("$APACHE_ROOT/conf")
     [[ -d "$APACHE_ROOT/conf.d" ]] && SEARCH_DIRS+=("$APACHE_ROOT/conf.d")
@@ -1444,6 +1450,8 @@ print_current_vs_proposed() {
 # ----------------- main -----------------
 
 preflight_validate_options
+
+bootstrap_environment
 
 if [[ "$MODE" == "locate" ]]; then
     locate_current_mpm_directives
