@@ -107,8 +107,8 @@ Usage: $0 [--analyze] [--locate] [--apply] [--version] [--json] [--batch] [--exp
   --analyze           (default) Print recommended Apache MPM config based on current RAM/cores
   --locate            Show which Apache config files currently define MPM-related directives
   --apply             Safely write/update recommended config into a cPanel include (or generic conf.d)
-  --json              Emit analyze output as JSON for automation (mutually exclusive with --locate)
-  --batch             Emit analyze output as a single-line bash-friendly key=value string (mutually exclusive with --locate)
+  --json              Emit analyze/apply output as JSON for automation (mutually exclusive with --locate)
+  --batch             Emit analyze/apply output as a single-line bash-friendly key=value string (mutually exclusive with --locate)
   --export <path>     Write ONLY the recommended Smart Tuner block to <path> (no config edits/reloads)
   --no-reload         Skip Apache reload/restart after successful --apply (writes config only)
   --mpm <type>        Force MPM assumption (prefork|worker|event) when binary probing is unavailable
@@ -328,6 +328,11 @@ log_message() {
     fi
 }
 
+print_if_text() {
+    [[ "$OUTPUT_FORMAT" == "text" ]] || return
+    echo "$@"
+}
+
 start_progress_indicator() {
     [[ "$OUTPUT_FORMAT" == "json" || "$OUTPUT_FORMAT" == "batch" ]] && return
     [[ -t 1 ]] || return
@@ -362,8 +367,8 @@ stop_progress_indicator() {
 }
 
 preflight_validate_options() {
-    if [[ "$MODE" != "analyze" && ( "$OUTPUT_FORMAT" == "json" || "$OUTPUT_FORMAT" == "batch" ) ]]; then
-        echo "ERROR: --$OUTPUT_FORMAT is only supported with --analyze mode."
+    if [[ "$MODE" == "locate" && ( "$OUTPUT_FORMAT" == "json" || "$OUTPUT_FORMAT" == "batch" ) ]]; then
+        echo "ERROR: --$OUTPUT_FORMAT is not supported with --locate mode."
         exit 1
     fi
 
@@ -1132,7 +1137,7 @@ export_recommended_block() {
 
     printf "%b" "$RECOMMENDED_BLOCK" > "$DEST"
 
-    if [[ "$OUTPUT_FORMAT" != "json" ]]; then
+    if [[ "$OUTPUT_FORMAT" == "text" ]]; then
         echo "Smart Tuner block exported to: $DEST"
     fi
 
@@ -1397,33 +1402,33 @@ handle_post_apply() {
     local target_file="$3"
 
     if [[ "$configtest_status" == "fail" ]]; then
-        echo "ERROR: Apache configtest FAILED after applying changes."
-        echo "Restoring backup: $backup_file"
+        echo "ERROR: Apache configtest FAILED after applying changes." >&2
+        echo "Restoring backup: $backup_file" >&2
         cp -p "$backup_file" "$target_file"
         log_message "ERROR" "Post-apply configtest failed; restored backup $backup_file"
         if [[ "$IS_CPANEL" -eq 1 && -x /scripts/rebuildhttpdconf ]]; then
             /scripts/rebuildhttpdconf
         fi
-        apache_configtest || echo "WARNING: Apache config still failing after rollback; manual intervention required."
+        apache_configtest || echo "WARNING: Apache config still failing after rollback; manual intervention required." >&2
         exit 1
     fi
 
     if [[ "${APACHE_RUNNING:-0}" -ne 1 ]]; then
-        echo "Configtest PASSED. Apache appears stopped; skipping reload."
-        echo "Start Apache manually to apply new settings, e.g. systemctl start httpd"
-        echo "Apache Smart Tuner: configuration written; awaiting manual Apache start."
+        print_if_text "Configtest PASSED. Apache appears stopped; skipping reload."
+        print_if_text "Start Apache manually to apply new settings, e.g. systemctl start httpd"
+        print_if_text "Apache Smart Tuner: configuration written; awaiting manual Apache start."
         log_message "WARN" "Config applied but Apache not running; skipped reload"
         log_message "INFO" "Applied Smart Tuner configuration to $target_file with tier $TIER and MPM $MPM_TYPE"
     elif [[ "$RELOAD_AFTER_APPLY" -eq 0 ]]; then
-        echo "Configtest PASSED. Reload skipped due to --no-reload."
-        echo "Apache Smart Tuner: configuration written; reload manually to activate."
+        print_if_text "Configtest PASSED. Reload skipped due to --no-reload."
+        print_if_text "Apache Smart Tuner: configuration written; reload manually to activate."
         log_message "INFO" "Config applied to $target_file with reload intentionally skipped"
     else
-        echo "Configtest PASSED. Reloading Apache..."
+        print_if_text "Configtest PASSED. Reloading Apache..."
         reload_apache
         log_message "INFO" "Reloaded Apache after applying Smart Tuner configuration"
 
-        echo "Apache Smart Tuner: configuration successfully applied."
+        print_if_text "Apache Smart Tuner: configuration successfully applied."
         log_message "INFO" "Applied Smart Tuner configuration to $target_file with tier $TIER and MPM $MPM_TYPE"
     fi
 }
@@ -1431,15 +1436,15 @@ handle_post_apply() {
 # Apply the recommended block with backups, cleanup, and optional reloads.
 apply_recommended_config() {
     if [[ "$EUID" -ne 0 ]]; then
-        echo "ERROR: --apply must be run as root."
+        echo "ERROR: --apply must be run as root." >&2
         exit 1
     fi
 
     touch "$LOG_FILE" 2>/dev/null || true
 
-    echo "Running preflight Apache configtest..."
+    print_if_text "Running preflight Apache configtest..."
     if ! apache_configtest; then
-        echo "ERROR: Apache configtest FAILED before making changes."
+        echo "ERROR: Apache configtest FAILED before making changes." >&2
         log_message "ERROR" "Preflight Apache configtest failed; aborting apply"
         exit 1
     fi
@@ -1458,7 +1463,7 @@ apply_recommended_config() {
     [[ ! -f "$TARGET_FILE" ]] && touch "$TARGET_FILE"
 
     if config_matches_recommendation "$TARGET_FILE"; then
-        echo "Smart Tuner block already matches recommendation in $TARGET_FILE; skipping backup and reload."
+        print_if_text "Smart Tuner block already matches recommendation in $TARGET_FILE; skipping backup and reload."
         log_message "INFO" "Skipped apply: $TARGET_FILE already contains current Smart Tuner block"
         return
     fi
@@ -1467,7 +1472,7 @@ apply_recommended_config() {
     TS=$(date +%Y%m%d%H%M%S)
     BACKUP_FILE="${TARGET_FILE}.bk-${TS}"
     cp -p "$TARGET_FILE" "$BACKUP_FILE"
-    echo "Backup created at: $BACKUP_FILE"
+    print_if_text "Backup created at: $BACKUP_FILE"
     log_message "INFO" "Backup created at $BACKUP_FILE for target $TARGET_FILE"
 
     local tmpfile
@@ -1504,12 +1509,12 @@ apply_recommended_config() {
     printf "%b" "$RECOMMENDED_BLOCK" >> "$TARGET_FILE"
 
     if [[ "$IS_CPANEL" -eq 1 && -x /scripts/rebuildhttpdconf ]]; then
-        echo "Detected cPanel. Running /scripts/rebuildhttpdconf..."
+        print_if_text "Detected cPanel. Running /scripts/rebuildhttpdconf..."
         /scripts/rebuildhttpdconf
         log_message "INFO" "Ran /scripts/rebuildhttpdconf after applying Smart Tuner block"
     fi
 
-    echo "Running Apache configtest after applying changes..."
+    print_if_text "Running Apache configtest after applying changes..."
     if apache_configtest; then
         handle_post_apply "pass" "$BACKUP_FILE" "$TARGET_FILE"
     else
