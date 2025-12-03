@@ -102,12 +102,13 @@ set_mode() {
 
 usage() {
     cat <<EOF
-Usage: $0 [--analyze] [--locate] [--apply] [--version] [--json] [--export <path>] [--no-reload] [--mpm <type>] [--budget <0.x>] [--log-file <path|none>]
+Usage: $0 [--analyze] [--locate] [--apply] [--version] [--json] [--batch] [--export <path>] [--no-reload] [--mpm <type>] [--budget <0.x>] [--log-file <path|none>]
 
   --analyze           (default) Print recommended Apache MPM config based on current RAM/cores
   --locate            Show which Apache config files currently define MPM-related directives
   --apply             Safely write/update recommended config into a cPanel include (or generic conf.d)
   --json              Emit analyze output as JSON for automation (mutually exclusive with --locate)
+  --batch             Emit analyze output as a single-line bash-friendly key=value string (mutually exclusive with --locate)
   --export <path>     Write ONLY the recommended Smart Tuner block to <path> (no config edits/reloads)
   --no-reload         Skip Apache reload/restart after successful --apply (writes config only)
   --mpm <type>        Force MPM assumption (prefork|worker|event) when binary probing is unavailable
@@ -152,6 +153,9 @@ parse_cli_arguments() {
                         ;;
                     json)
                         OUTPUT_FORMAT="json"
+                        ;;
+                    batch)
+                        OUTPUT_FORMAT="batch"
                         ;;
                     no-reload)
                         RELOAD_AFTER_APPLY=0
@@ -325,7 +329,7 @@ log_message() {
 }
 
 start_progress_indicator() {
-    [[ "$OUTPUT_FORMAT" == "json" ]] && return
+    [[ "$OUTPUT_FORMAT" == "json" || "$OUTPUT_FORMAT" == "batch" ]] && return
     [[ -t 1 ]] || return
 
     local MESSAGE="$1"
@@ -345,7 +349,7 @@ start_progress_indicator() {
 }
 
 stop_progress_indicator() {
-    [[ "$OUTPUT_FORMAT" == "json" ]] && return
+    [[ "$OUTPUT_FORMAT" == "json" || "$OUTPUT_FORMAT" == "batch" ]] && return
     [[ -t 1 ]] || return
 
     if [[ -n "${SPINNER_PID:-}" ]]; then
@@ -358,8 +362,8 @@ stop_progress_indicator() {
 }
 
 preflight_validate_options() {
-    if [[ "$OUTPUT_FORMAT" == "json" && "$MODE" != "analyze" ]]; then
-        echo "ERROR: --json is only supported with --analyze mode."
+    if [[ "$MODE" != "analyze" && ( "$OUTPUT_FORMAT" == "json" || "$OUTPUT_FORMAT" == "batch" ) ]]; then
+        echo "ERROR: --$OUTPUT_FORMAT is only supported with --analyze mode."
         exit 1
     fi
 
@@ -945,6 +949,18 @@ json_bool() {
     fi
 }
 
+format_batch_value() {
+    local value="$1"
+    local fallback="$2"
+
+    value=$(sanitize_value "${value:-}")
+    if [[ -z "$value" ]]; then
+        value="$fallback"
+    fi
+
+    echo "$value"
+}
+
 extract_tuner_block() {
     local FILE="$1"
     [[ -f "$FILE" ]] || return
@@ -1029,6 +1045,74 @@ build_json_output() {
   }
 }
 EOF
+}
+
+build_batch_output() {
+    local -a fields=()
+
+    fields+=("version=$(sanitize_value "$VERSION")")
+    fields+=("mode=$MODE")
+    fields+=("mpm=$MPM_TYPE")
+    fields+=("mpm_source=$(sanitize_value "$MPM_SOURCE")")
+    fields+=("tier=$TIER")
+    fields+=("total_ram_mb=$TOTAL_MEM")
+    fields+=("cpu_cores=$CORES")
+    fields+=("apache_running=$APACHE_RUNNING")
+    fields+=("observed_processes=$APACHE_PROCS")
+    fields+=("avg_httpd_mb=$AVG_PROC_MB")
+    fields+=("apache_budget_mb=$APACHE_BUDGET_MB")
+    fields+=("apache_budget_pct=$APACHE_PCT")
+    fields+=("apache_budget_source=$BUDGET_SOURCE")
+    fields+=("log_file=$(format_batch_value "${LOG_FILE:-}" "none")")
+    fields+=("export_path=$(format_batch_value "${EXPORT_PATH:-}" "none")")
+    fields+=("error_log_path=$(format_batch_value "$APACHE_ERROR_LOG" "unknown")")
+    fields+=("error_log_sampled_lines=$ERROR_LOG_SAMPLE_LINES")
+    fields+=("log_review_status=$LOG_REVIEW_STATUS")
+    fields+=("scoreboard_hits=$SCOREBOARD_HITS")
+    fields+=("server_limit_hits=$SERVER_LIMIT_HITS")
+    fields+=("restarts_total=$RESTART_TOTAL")
+    fields+=("restart_max_per_day=$RESTART_MAX_PER_DAY")
+    fields+=("common_errors_segfaults=${COMMON_ERROR_COUNTS[segfaults]:-0}")
+    fields+=("common_errors_timeouts=${COMMON_ERROR_COUNTS[timeouts]:-0}")
+    fields+=("common_errors_denied=${COMMON_ERROR_COUNTS[denied]:-0}")
+
+    fields+=("current_server_limit=$(format_batch_value "$CUR_SERVER_LIMIT" "unknown")")
+    fields+=("current_max_requestworkers=$(format_batch_value "$CUR_MAX_WORKERS" "unknown")")
+    fields+=("current_start_servers=$(format_batch_value "$CUR_START_SERVERS" "unknown")")
+    fields+=("current_max_connections_per_child=$(format_batch_value "$CUR_MAX_CONN_PER_CHILD" "unknown")")
+
+    if [[ "$MPM_TYPE" == "prefork" ]]; then
+        fields+=("current_threads_per_child=na")
+        fields+=("current_min_spare_threads=na")
+        fields+=("current_max_spare_threads=na")
+        fields+=("current_min_spare_servers=$(format_batch_value "$CUR_MIN_SPARE_SERVERS" "unknown")")
+        fields+=("current_max_spare_servers=$(format_batch_value "$CUR_MAX_SPARE_SERVERS" "unknown")")
+
+        fields+=("recommended_threads_per_child=na")
+        fields+=("recommended_min_spare_threads=na")
+        fields+=("recommended_max_spare_threads=na")
+        fields+=("recommended_min_spare_servers=$(format_batch_value "$MIN_SPARE_SERVERS" "unknown")")
+        fields+=("recommended_max_spare_servers=$(format_batch_value "$MAX_SPARE_SERVERS" "unknown")")
+    else
+        fields+=("current_threads_per_child=$(format_batch_value "$CUR_THREADS_PER_CHILD" "unknown")")
+        fields+=("current_min_spare_threads=$(format_batch_value "$CUR_MIN_SPARE_THREADS" "unknown")")
+        fields+=("current_max_spare_threads=$(format_batch_value "$CUR_MAX_SPARE_THREADS" "unknown")")
+        fields+=("current_min_spare_servers=na")
+        fields+=("current_max_spare_servers=na")
+
+        fields+=("recommended_threads_per_child=$(format_batch_value "$THREADS_PER_CHILD" "unknown")")
+        fields+=("recommended_min_spare_threads=$(format_batch_value "$MIN_SPARE_THREADS" "unknown")")
+        fields+=("recommended_max_spare_threads=$(format_batch_value "$MAX_SPARE_THREADS" "unknown")")
+        fields+=("recommended_min_spare_servers=na")
+        fields+=("recommended_max_spare_servers=na")
+    fi
+
+    fields+=("recommended_server_limit=$(format_batch_value "$SERVER_LIMIT" "unknown")")
+    fields+=("recommended_max_requestworkers=$(format_batch_value "$MAX_WORKERS" "unknown")")
+    fields+=("recommended_start_servers=$(format_batch_value "$START_SERVERS_ROUNDED" "unknown")")
+    fields+=("recommended_max_connections_per_child=$(format_batch_value "$MAX_CONN_PER_CHILD" "unknown")")
+
+    printf "%s\n" "${fields[*]}"
 }
 
 export_recommended_block() {
@@ -1564,6 +1648,8 @@ fi
 
 if [[ "$OUTPUT_FORMAT" == "json" ]]; then
     build_json_output
+elif [[ "$OUTPUT_FORMAT" == "batch" ]]; then
+    build_batch_output
 else
     echo "------------------------------------------------"
     echo " Apache Smart Tuner Analysis"
