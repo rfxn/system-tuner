@@ -26,9 +26,10 @@ chmod +x apache-tuner
 
 ### Flags
 ```
-./apache-tuner [--analyze] [--locate] [--apply] [--json] [--export <path>] [--no-reload] [--mpm <type>] [--budget <0.x>] [--log-file <path|none>] [--version]
+./apache-tuner [--analyze] [--locate] [--apply] [--json] [--batch] [--export <path>] [--no-reload] [--mpm <type>] [--budget <0.x>] [--log-file <path|none>] [--version]
 ```
 - `--json`: Return analysis as JSON (for monitoring/CM pipelines). Only valid with analyze mode.
+- `--batch`: Emit analysis as a single-line bash-friendly `key=value` string for fleet-wide collection.
 - `--export`: Write only the tuned config block to a file without editing Apache configs.
 - `--no-reload`: When combined with `--apply`, write the config but skip the reload/restart.
 - `--mpm`: Force the assumed MPM type (`prefork`, `worker`, or `event`) when detection is blocked.
@@ -47,6 +48,12 @@ Produce JSON suitable for automation or dashboards:
 
 ```bash
 ./apache-tuner --json
+```
+
+Emit a single-line batch string for fleet-wide collection pipelines:
+
+```bash
+./apache-tuner --batch
 ```
 
 Export only the recommended block for review or CM pipelines:
